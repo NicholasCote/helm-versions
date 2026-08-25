@@ -1,6 +1,77 @@
 // Helm Chart Dashboard JavaScript
 let refreshInterval;
 
+// Cluster filter state. 'all' shows every cluster the API returned.
+const CLUSTER_FILTER_KEY = 'helmDashboard.selectedCluster';
+let selectedCluster = loadSelectedCluster();
+let latestData = null;  // Cached so switching clusters re-renders without a refetch
+
+function loadSelectedCluster() {
+    try {
+        return localStorage.getItem(CLUSTER_FILTER_KEY) || 'all';
+    } catch (e) {
+        return 'all';
+    }
+}
+
+function saveSelectedCluster(value) {
+    try {
+        localStorage.setItem(CLUSTER_FILTER_KEY, value);
+    } catch (e) {
+        // Storage unavailable (private mode, blocked cookies) - filter still works
+    }
+}
+
+function onClusterChange(value) {
+    selectedCluster = value;
+    saveSelectedCluster(value);
+    if (latestData) {
+        renderData(latestData);
+    }
+}
+
+// Rebuild the dropdown options to match the clusters actually present in the data
+function populateClusterFilter(clusters) {
+    const select = document.getElementById('clusterFilter');
+    if (!select) return;
+
+    const names = Object.keys(clusters);
+
+    // A remembered cluster may not exist anymore (e.g. CLUSTERS was narrowed)
+    if (selectedCluster !== 'all' && !names.includes(selectedCluster)) {
+        selectedCluster = 'all';
+        saveSelectedCluster(selectedCluster);
+    }
+
+    const wanted = ['all'].concat(names).join(',');
+    if (select.dataset.options !== wanted) {
+        select.innerHTML = '<option value="all">All clusters</option>' +
+            names.map(name => `<option value="${name}">${name.toUpperCase()}</option>`).join('');
+        select.dataset.options = wanted;
+    }
+
+    select.value = selectedCluster;
+}
+
+function filterClusters(clusters) {
+    if (selectedCluster === 'all' || !clusters[selectedCluster]) {
+        return clusters;
+    }
+    return { [selectedCluster]: clusters[selectedCluster] };
+}
+
+// Totals for whatever is currently visible, so the cards match the dropdown
+function summarizeClusters(clusters) {
+    return Object.values(clusters).reduce((totals, cluster) => {
+        const summary = cluster.summary || {};
+        totals.total_charts += summary.total_charts || 0;
+        totals.needs_update += summary.needs_update || 0;
+        totals.up_to_date += summary.up_to_date || 0;
+        totals.no_version_info += summary.no_version_info || 0;
+        return totals;
+    }, { total_charts: 0, needs_update: 0, up_to_date: 0, no_version_info: 0 });
+}
+
 async function fetchData() {
     try {
         const response = await fetch('/api/charts');
@@ -17,10 +88,9 @@ function formatDate(isoString) {
     return new Date(isoString).toLocaleString();
 }
 
-function updateSummaryCards(data) {
-    if (!data.data || !data.data.summary) return;
+function updateSummaryCards(summary) {
+    if (!summary) return;
     
-    const summary = data.data.summary;
     document.getElementById('summaryCards').innerHTML = `
         <div class="summary-card total">
             <div class="card-header">Total Charts</div>
@@ -72,13 +142,13 @@ function renderChartCard(chart) {
     ` : `
         <div class="chart-versions">
             <span class="version current">${chart.current_version}</span>
-            <span style="color: #999; font-style: italic;">No version info</span>
+            <span style="color: #999; font-style: italic;">${chart.no_version_reason || 'No version info'}</span>
         </div>
     `;
 
     return `
         <div class="chart-card ${statusClass}">
-            <div class="chart-name"><i class="fas fa-cube"></i> ${chart.name}</div>
+            <div class="chart-name"><i class="fas fa-cube"></i> ${chart.name}${chart.source ? `<span class="chart-source">${chart.source}</span>` : ''}</div>
             ${versionDisplay}
             ${chart.repo_url ? `<div class="chart-repo"><i class="fas fa-link"></i> ${chart.repo_url}</div>` : ''}
         </div>
@@ -86,6 +156,8 @@ function renderChartCard(chart) {
 }
 
 function renderData(data) {
+    latestData = data;
+
     // Show updating banner if refresh is in progress
     if (data.update_in_progress) {
         const banner = `
@@ -96,9 +168,10 @@ function renderData(data) {
         
         // If we have existing data, show it with the banner
         if (data.data && data.data.clusters) {
-            updateSummaryCards(data);
-            const clustersHtml = generateClustersHtml(data.data.clusters);
-            document.getElementById('content').innerHTML = banner + clustersHtml;
+            populateClusterFilter(data.data.clusters);
+            const visible = filterClusters(data.data.clusters);
+            updateSummaryCards(summarizeClusters(visible));
+            document.getElementById('content').innerHTML = banner + generateClustersHtml(visible);
             document.getElementById('lastUpdate').textContent = formatDate(data.last_update);
             return;
         } else {
@@ -134,14 +207,24 @@ function renderData(data) {
         return;
     }
 
-    updateSummaryCards(data);
-    const clustersHtml = generateClustersHtml(data.data.clusters);
-    document.getElementById('content').innerHTML = clustersHtml;
+    populateClusterFilter(data.data.clusters);
+    const visible = filterClusters(data.data.clusters);
+    updateSummaryCards(summarizeClusters(visible));
+    document.getElementById('content').innerHTML = generateClustersHtml(visible);
     document.getElementById('lastUpdate').textContent = formatDate(data.last_update);
 }
 
 function generateClustersHtml(clusters) {
     let html = '';
+
+    if (Object.keys(clusters).length === 0) {
+        return `
+            <div class="error">
+                <h4><i class="fas fa-info-circle"></i> No clusters to show</h4>
+                <p>No data for the selected cluster.</p>
+            </div>
+        `;
+    }
     
     Object.keys(clusters).forEach(clusterName => {
         const cluster = clusters[clusterName];

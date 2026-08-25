@@ -78,6 +78,8 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-wrap: wrap;
+    gap: 15px;
 }
 
 .last-update {
@@ -366,4 +368,57 @@ body {
     .cluster-stats {
         justify-content: center;
     }
+}
+
+.chart-source {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    background-color: #e8eef2;
+    color: #4a5c68;
+    font-size: 0.7em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    vertical-align: middle;
+}
+
+.cluster-filter {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.cluster-filter label {
+    margin: 0;
+    font-weight: 600;
+    color: #4a5c68;
+    white-space: nowrap;
+}
+
+.cluster-filter select {
+    padding: 6px 30px 6px 12px;
+    border: 1px solid #ccd6dd;
+    border-radius: 6px;
+    background-color: #fff;
+    color: #2c3e50;
+    font-family: inherit;
+    font-size: 0.95em;
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%234a5c68' d='M4 6l4 4 4-4z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 14px;
+}
+
+.cluster-filter select:hover {
+    border-color: #007fa3;
+}
+
+.cluster-filter select:focus {
+    outline: none;
+    border-color: #007fa3;
+    box-shadow: 0 0 0 2px rgba(0, 127, 163, 0.2);
 }

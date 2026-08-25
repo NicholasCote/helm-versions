@@ -9,7 +9,7 @@ import os
 from datetime import datetime
 import threading
 import time
-from tracker import HelmChartTracker  # Import your existing tracker
+from tracker import HelmChartTracker, clusters_from_env, CLUSTERS_ENV_VAR  # Import your existing tracker
 
 app = Flask(__name__)
 
@@ -27,8 +27,10 @@ def update_chart_data():
         # Get configuration from environment variables
         git_repo_url = os.getenv('GIT_REPO_URL', 'git@github.com:NCAR/cisl-cloud-charts.git')
         ssh_key_path = os.getenv('SSH_KEY_PATH')  # Don't provide default here
+        clusters = clusters_from_env()  # None means "all known clusters"
         
         print(f"Starting chart analysis with repo: {git_repo_url}")
+        print(f"Clusters: {', '.join(clusters) if clusters else 'all (%s not set)' % CLUSTERS_ENV_VAR}")
         print(f"SSH key path: {ssh_key_path}")
         print(f"SSH_KEY_CONTENT_BASE64 set: {bool(os.getenv('SSH_KEY_CONTENT_BASE64'))}")
         print(f"SSH_KEY_CONTENT set: {bool(os.getenv('SSH_KEY_CONTENT'))}")
@@ -43,7 +45,8 @@ def update_chart_data():
         
         tracker = HelmChartTracker(
             git_repo_url=git_repo_url,
-            ssh_key_path=ssh_key_path  # Pass None if not set
+            ssh_key_path=ssh_key_path,  # Pass None if not set
+            clusters=clusters
         )
         
         print("Analyzing charts...")
@@ -122,6 +125,7 @@ def debug():
     debug_info = {
         "git_repo_url": os.getenv('GIT_REPO_URL', 'Not set'),
         "ssh_key_path": os.getenv('SSH_KEY_PATH', 'Not set'),
+        "clusters": os.getenv(CLUSTERS_ENV_VAR, 'Not set (all clusters)'),
         "ssh_key_content_set": bool(os.getenv('SSH_KEY_CONTENT')),
         "update_in_progress": update_in_progress,
         "chart_data_keys": list(chart_data.keys()) if chart_data else None,

@@ -17,7 +17,7 @@
     <div class="header-section">
         <div class="header-content">
             <div class="logo-section">
-                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 80'%3E%3Ctext x='10' y='35' font-family='Poppins,Arial,sans-serif' font-size='24' font-weight='700' fill='%23007fa3'%3ECISL%3C/text%3E%3Ctext x='10' y='55' font-family='Poppins,Arial,sans-serif' font-size='12' fill='%23666'%3ENCAR%3C/text%3E%3C/svg%3E" class="logo" alt="NCAR CISL Logo">
+                <img src="static/CIRRUS_Logo.png" class="logo" alt="NCAR CISL CIRRUS Logo">
             </div>
             <div class="title-section">
                 <h1 class="main-title">Helm Chart Dashboard</h1>
@@ -31,6 +31,12 @@
         <!-- Controls Section -->
         <div class="controls-section">
             <div class="controls-content">
+                <div class="cluster-filter">
+                    <label for="clusterFilter"><i class="fas fa-filter"></i> Cluster:</label>
+                    <select id="clusterFilter" onchange="onClusterChange(this.value)">
+                        <option value="all">All clusters</option>
+                    </select>
+                </div>
                 <div class="last-update">
                     <i class="fas fa-clock"></i> Last updated: <span id="lastUpdate">Never</span>
                 </div>

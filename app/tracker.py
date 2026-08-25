@@ -5,6 +5,7 @@ Analyzes private git repository to find current chart versions across clusters
 and compares with latest available versions
 """
 
+import argparse
 import os
 import yaml
 import requests
@@ -17,6 +18,7 @@ import shutil
 import re
 import concurrent.futures
 import threading
+from urllib.parse import urljoin
 
 @dataclass
 class ChartInfo:
@@ -27,16 +29,41 @@ class ChartInfo:
     repo_url: str = None
     chart_name: str = None
     needs_update: bool = False
+    source: str = None  # Which cluster app file this came from
+    class_name: str = None  # Ingress class (external/internal) for apps with a class list
     
     def __post_init__(self):
         if self.latest_version and self.current_version != self.latest_version:
             self.needs_update = True
 
 class HelmChartTracker:
-    def __init__(self, git_repo_url: str, ssh_key_path: str = None):
+    DEFAULT_CLUSTERS = ['mgmt', 'nwc1', 'mlc1', 'nwc3', 'mlc3']
+
+    # Per-cluster app files to read, as (source label, filename). Both use the same
+    # `apps: {name: {enable, chartVersion}}` schema.
+    APP_SOURCES = [
+        ('infraapps', 'infraapps.yaml'),
+        ('bootstrapapps', 'bootstrapapps.yaml'),
+    ]
+
+    # Whole-line Go template control directives, dropped before YAML parsing
+    TEMPLATE_DIRECTIVE_LINE = re.compile(
+        r'^\s*\{\{-?\s*(if|else|end|range|with|define|template|include|block)\b.*\}\}\s*$')
+    # Any `.Values.apps.<name>.enable` reference, wherever it appears in a template
+    APP_NAME_PATTERN = re.compile(r'\.Values\.apps\.([A-Za-z0-9_-]+)\.enable')
+    # Any remaining {{ ... }} expression, replaced with a placeholder scalar
+    TEMPLATE_EXPRESSION = re.compile(r'\{\{-?.*?-?\}\}', re.DOTALL)
+
+    # Directories holding Argo Application templates. Missing ones are skipped.
+    TEMPLATE_DIRS = [
+        os.path.join('infra-chart', 'templates'),
+        os.path.join('bootstrap-chart', 'templates'),
+    ]
+
+    def __init__(self, git_repo_url: str, ssh_key_path: str = None, clusters: List[str] = None):
         self.git_repo_url = git_repo_url
         self.ssh_key_path = ssh_key_path
-        self.clusters = ['mgmt', 'nwc1', 'mlc1']
+        self.clusters = list(clusters) if clusters else list(self.DEFAULT_CLUSTERS)
         self.chart_mappings = {}  # Maps app names to chart info
         self.version_cache = {}  # Cache for chart versions: {(chart_name, repo_url): version}
         self.cache_lock = threading.Lock()  # Thread safety for cache
@@ -175,104 +202,307 @@ class HelmChartTracker:
             print(f"Standard output: {e.stdout if e.stdout else 'No standard output'}")
             return False
     
-    def parse_cluster_infraapps(self, repo_path: str, cluster: str) -> Dict[str, Dict]:
-        """Parse the infraapps.yaml file for a specific cluster"""
-        infraapps_path = os.path.join(repo_path, 'clusters', cluster, 'infraapps.yaml')
+    def parse_cluster_app_file(self, repo_path: str, cluster: str, filename: str) -> Dict[str, Dict]:
+        """Parse one of a cluster's app files (infraapps.yaml, bootstrapapps.yaml, ...)
         
-        if not os.path.exists(infraapps_path):
-            print(f"Warning: infraapps.yaml not found for cluster {cluster} at {infraapps_path}")
+        An app is kept if it's enabled and pins a version either at the top level or on at
+        least one entry of a `class:` list (traefik2 and friends pin per class only).
+        """
+        app_file_path = os.path.join(repo_path, 'clusters', cluster, filename)
+        
+        if not os.path.exists(app_file_path):
+            print(f"Warning: {filename} not found for cluster {cluster} at {app_file_path}")
             return {}
         
-        with open(infraapps_path, 'r') as f:
-            infraapps_data = yaml.safe_load(f)
+        with open(app_file_path, 'r') as f:
+            app_file_data = yaml.safe_load(f) or {}
         
-        apps = infraapps_data.get('apps', {})
+        apps = app_file_data.get('apps', {})
         chart_info = {}
         
         for app_name, app_config in apps.items():
-            if app_config.get('enable', False) and 'chartVersion' in app_config:
-                chart_info[app_name] = {
-                    'chartVersion': app_config['chartVersion'],
-                    'policiesChartVersion': app_config.get('policiesChartVersion')
-                }
+            if not app_config.get('enable', False):
+                continue
+            
+            base_version = app_config.get('chartVersion')
+            classes = self.parse_app_classes(app_name, app_config, base_version)
+            
+            if not classes and not base_version:
+                continue
+            
+            chart_info[app_name] = {
+                'chartVersion': base_version,
+                'policiesChartVersion': app_config.get('policiesChartVersion'),
+                'classes': classes
+            }
         
         return chart_info
+
+    @staticmethod
+    def parse_app_classes(app_name: str, app_config: Dict, base_version: str) -> List[Dict]:
+        """Normalize an app's `class:` list into [{'name', 'chartVersion'}, ...]
+        
+        A class without its own chartVersion inherits the app's top-level one.
+        """
+        raw_classes = app_config.get('class') or []
+        
+        if not isinstance(raw_classes, list):
+            print(f"    ⚠ {app_name}: 'class' is not a list, ignoring it")
+            return []
+        
+        classes = []
+        for entry in raw_classes:
+            if not isinstance(entry, dict):
+                print(f"    ⚠ {app_name}: skipping malformed class entry {entry!r}")
+                continue
+            
+            class_name = entry.get('name')
+            class_version = entry.get('chartVersion', base_version)
+            
+            if not class_name:
+                print(f"    ⚠ {app_name}: skipping class entry with no name")
+                continue
+            if not class_version:
+                print(f"    ⚠ {app_name}: class '{class_name}' has no chartVersion, skipping")
+                continue
+            
+            classes.append({'name': class_name, 'chartVersion': class_version})
+        
+        return classes
+
+    def parse_cluster_infraapps(self, repo_path: str, cluster: str) -> Dict[str, Dict]:
+        """Parse the infraapps.yaml file for a specific cluster"""
+        return self.parse_cluster_app_file(repo_path, cluster, 'infraapps.yaml')
+
+    def parse_cluster_bootstrapapps(self, repo_path: str, cluster: str) -> Dict[str, Dict]:
+        """Parse the bootstrapapps.yaml file for a specific cluster"""
+        return self.parse_cluster_app_file(repo_path, cluster, 'bootstrapapps.yaml')
+
+    def parse_cluster_apps(self, repo_path: str, cluster: str) -> List[Tuple[str, Dict, str]]:
+        """Collect every enabled app for a cluster across all app files
+        
+        Returns (app_name, version_info, source) tuples, where version_info carries a
+        resolved 'chartVersion' plus an optional 'className'. An app with a `class:` list
+        yields one tuple per class, since each class is deployed as its own release and can
+        sit on a different version.
+        
+        A list rather than a dict so neither multiple classes nor an app appearing in more
+        than one file end up overwriting each other.
+        """
+        cluster_apps = []
+        
+        for source, filename in self.APP_SOURCES:
+            apps = self.parse_cluster_app_file(repo_path, cluster, filename)
+            entries = []
+            
+            for app_name, version_info in apps.items():
+                classes = version_info.get('classes') or []
+                policies_version = version_info.get('policiesChartVersion')
+                
+                if classes:
+                    base_version = version_info.get('chartVersion')
+                    class_versions = {c['chartVersion'] for c in classes}
+                    
+                    # A top-level pin that no class agrees with is worth surfacing: the
+                    # classes are what actually deploy, so the top level may be stale.
+                    if base_version and base_version not in class_versions:
+                        print(f"    ⚠ {app_name}: top-level chartVersion {base_version} "
+                              f"differs from its class versions "
+                              f"({', '.join(sorted(class_versions))}); reporting classes only")
+                    
+                    for class_info in classes:
+                        entries.append((app_name, {
+                            'chartVersion': class_info['chartVersion'],
+                            'policiesChartVersion': policies_version,
+                            'className': class_info['name']
+                        }, source))
+                else:
+                    entries.append((app_name, {
+                        'chartVersion': version_info['chartVersion'],
+                        'policiesChartVersion': policies_version,
+                        'className': None
+                    }, source))
+            
+            print(f"  {source}: {len(apps)} enabled apps -> {len(entries)} versioned releases")
+            cluster_apps.extend(entries)
+        
+        return cluster_apps
     
+    def strip_go_template(self, content: str) -> str:
+        """Turn a Go-templated Argo Application into something YAML can parse
+        
+        Whole-line control directives ({{- if }}, {{- end }}, ...) are dropped, and any
+        remaining {{ ... }} expression becomes a plain scalar placeholder.
+        """
+        lines = [line for line in content.splitlines()
+                 if not self.TEMPLATE_DIRECTIVE_LINE.match(line)]
+        return self.TEMPLATE_EXPRESSION.sub('TEMPLATED', '\n'.join(lines))
+
     def parse_argo_application_template(self, template_path: str) -> List[Dict[str, str]]:
-        """Parse a single Argo Application template to extract all chart and repo info"""
+        """Parse a single Argo Application template to extract all chart and repo info
+        
+        Handles both `spec.source` (single) and `spec.sources` (list), and both classic
+        Helm repos (https://) and OCI registries (oci://).
+        """
         if not os.path.exists(template_path):
             return []
         
         try:
             with open(template_path, 'r') as f:
                 content = f.read()
-            
-            charts = []
-            
-            # Split content by sources to handle multiple chart definitions
-            # Look for patterns that indicate separate chart sources
-            sources_pattern = r'- repoURL: (https://[^\s\n]+).*?chart: ([^\s\n]+).*?(?:releaseName: ([^\s\n]+))?'
-            
-            # Find all chart definitions in the template
-            matches = re.finditer(sources_pattern, content, re.DOTALL | re.MULTILINE)
-            
-            for match in matches:
-                repo_url = match.group(1).strip().strip('"').strip("'")
-                chart_name = match.group(2).strip().strip('"').strip("'")
-                release_name = match.group(3).strip().strip('"').strip("'") if match.group(3) else chart_name
-                
-                # Skip git repositories (your cloud-charts repo)
-                if 'github.com' in repo_url and '.git' in repo_url:
-                    print(f"    Skipping git repo: {repo_url}")
-                    continue
-                
-                # This is a Helm repository
-                charts.append({
-                    'chart_name': chart_name,
-                    'repo_url': repo_url,
-                    'release_name': release_name
-                })
-                print(f"    Found chart: {chart_name} (release: {release_name}) @ {repo_url}")
-            
-            return charts
-                
         except Exception as e:
-            print(f"Error parsing {template_path}: {e}")
+            print(f"Error reading {template_path}: {e}")
+            return []
         
-        return []
+        try:
+            application = yaml.safe_load(self.strip_go_template(content))
+        except yaml.YAMLError as e:
+            print(f"    ⚠ Could not parse {os.path.basename(template_path)} as YAML ({e});"
+                  f" falling back to regex scan")
+            return self.parse_argo_application_regex(content)
+        
+        if not isinstance(application, dict):
+            print(f"    ⚠ {os.path.basename(template_path)} did not parse to a mapping;"
+                  f" falling back to regex scan")
+            return self.parse_argo_application_regex(content)
+        
+        spec = application.get('spec') or {}
+        
+        # Argo allows either `source` (single) or `sources` (list)
+        raw_sources = spec.get('sources') or []
+        if not isinstance(raw_sources, list):
+            raw_sources = []
+        if isinstance(spec.get('source'), dict):
+            raw_sources = [spec['source']] + raw_sources
+        
+        charts = []
+        for source in raw_sources:
+            if not isinstance(source, dict):
+                continue
+            
+            chart = self.chart_from_source(source)
+            if chart:
+                charts.append(chart)
+                print(f"    Found chart: {chart['chart_name']} "
+                      f"(release: {chart['release_name']}) @ {chart['repo_url']}")
+        
+        return charts
+
+    def chart_from_source(self, source: Dict) -> Optional[Dict[str, str]]:
+        """Turn one Argo source mapping into chart info, or None if it isn't a Helm chart"""
+        repo_url = source.get('repoURL')
+        chart_name = source.get('chart')
+        
+        # Sources without a `chart` are git/ref sources (path-based or $values)
+        if not repo_url or not chart_name:
+            return None
+        
+        repo_url = str(repo_url).strip()
+        chart_name = str(chart_name).strip()
+        
+        if not self.is_helm_repo_url(repo_url):
+            print(f"    Skipping non-Helm repo: {repo_url}")
+            return None
+        
+        helm_config = source.get('helm')
+        release_name = chart_name
+        if isinstance(helm_config, dict) and helm_config.get('releaseName'):
+            release_name = str(helm_config['releaseName']).strip()
+        
+        return {
+            'chart_name': chart_name,
+            'repo_url': repo_url,
+            'release_name': release_name
+        }
+
+    @staticmethod
+    def is_helm_repo_url(repo_url: str) -> bool:
+        """True for HTTP(S) chart repos and OCI registries, False for git sources"""
+        if repo_url.startswith(('http://', 'https://')):
+            # A git repo served over https still isn't a chart repo
+            return not repo_url.endswith('.git')
+        
+        if repo_url.startswith('oci://'):
+            return True
+        
+        if repo_url.startswith(('git@', 'ssh://', 'git://')):
+            return False
+        
+        # Argo also accepts a scheme-less OCI reference (ghcr.io/deliveryhero/helm-charts).
+        # Treat the first segment as a registry if it looks like a host, the same way
+        # container tooling distinguishes a registry from a bare repository name.
+        host = repo_url.split('/', 1)[0]
+        return '.' in host or ':' in host or host == 'localhost'
+
+    @classmethod
+    def is_oci_repo_url(cls, repo_url: str) -> bool:
+        """True for OCI registry references, with or without the oci:// scheme"""
+        if repo_url.startswith('oci://'):
+            return True
+        if repo_url.startswith(('http://', 'https://')):
+            return False
+        return cls.is_helm_repo_url(repo_url)
+
+    def parse_argo_application_regex(self, content: str) -> List[Dict[str, str]]:
+        """Best-effort fallback for templates that won't parse as YAML"""
+        charts = []
+        
+        sources_pattern = r'repoURL: ((?:https?|oci)://[^\s\n]+).*?chart: ([^\s\n]+)'
+        matches = re.finditer(sources_pattern, content, re.DOTALL | re.MULTILINE)
+        
+        for match in matches:
+            repo_url = match.group(1).strip().strip('"').strip("'")
+            chart_name = match.group(2).strip().strip('"').strip("'")
+            
+            if not self.is_helm_repo_url(repo_url):
+                print(f"    Skipping non-Helm repo: {repo_url}")
+                continue
+            
+            charts.append({
+                'chart_name': chart_name,
+                'repo_url': repo_url,
+                'release_name': chart_name
+            })
+            print(f"    Found chart (regex): {chart_name} @ {repo_url}")
+        
+        return charts
     
     def extract_app_name_from_template(self, template_path: str) -> Optional[str]:
-        """Extract the app name from the first line of the Argo Application template"""
+        """Extract the app name from an Argo Application template
+        
+        Scans the whole file for any `.Values.apps.<name>.enable` reference rather than
+        matching an exact `{{- if .Values.apps.X.enable }}` on line 1, so templates whose
+        guard is compound (`{{- if and .Values.apps.npd.enable ... }}`), differently
+        whitespaced, or not on the first line still resolve.
+        """
         try:
             with open(template_path, 'r') as f:
-                first_line = f.readline().strip()
-            
-            # Look for pattern: {{- if .Values.apps.APPNAME.enable }}
-            pattern = r'\{\{-\s*if\s+\.Values\.apps\.([^.\s]+)\.enable\s*\}\}'
-            match = re.search(pattern, first_line)
-            
-            if match:
-                app_name = match.group(1)
-                print(f"    Extracted app name from template: {app_name}")
-                return app_name
-            else:
-                print(f"    Could not extract app name from first line: {first_line}")
-                return None
-                
+                content = f.read()
         except Exception as e:
-            print(f"    Error reading first line of {template_path}: {e}")
+            print(f"    Error reading {template_path}: {e}")
             return None
+        
+        names = self.APP_NAME_PATTERN.findall(content)
+        
+        if not names:
+            print(f"    Could not find a .Values.apps.<name>.enable reference in "
+                  f"{os.path.basename(template_path)}")
+            return None
+        
+        # First occurrence is the guard at the top of the template
+        app_name = names[0]
+        
+        distinct = list(dict.fromkeys(names))
+        if len(distinct) > 1:
+            print(f"    Extracted app name from template: {app_name} "
+                  f"(template also references: {', '.join(distinct[1:])})")
+        else:
+            print(f"    Extracted app name from template: {app_name}")
+        
+        return app_name
 
-    def build_chart_mappings(self, repo_path: str) -> Dict[str, List[Dict]]:
-        """Build mappings between app names and their chart information"""
-        templates_dir = os.path.join(repo_path, 'infra-chart', 'templates')
-        mappings = {}
-        
-        if not os.path.exists(templates_dir):
-            print(f"Error: Argo Application templates directory not found at {templates_dir}")
-            return mappings
-        
-        print(f"Parsing Argo Application templates from: {templates_dir}")
+    def parse_templates_dir(self, templates_dir: str, mappings: Dict[str, List[Dict]]) -> None:
+        """Parse every Argo Application template in one directory into `mappings`"""
         existing_files = list(Path(templates_dir).glob("*.yaml"))
         print(f"Found {len(existing_files)} YAML files:")
         for f in existing_files:
@@ -287,19 +517,51 @@ class HelmChartTracker:
             # Then extract all chart info from this template
             chart_info_list = self.parse_argo_application_template(str(template_file))
             
-            if chart_info_list and app_name:
-                print(f"  Found {len(chart_info_list)} charts for app: {app_name}")
-                mappings[app_name] = chart_info_list
-                print(f"  ✓ Added mapping: {app_name}")
-            elif chart_info_list and not app_name:
+            if not chart_info_list:
+                print(f"  ✗ Could not extract chart info from {template_file.name}")
+                continue
+            
+            if not app_name:
                 # Fallback to filename-based approach if we can't extract from first line
                 base_name = template_file.stem
-                app_name_fallback = base_name.replace('-', '').replace('_', '')
-                print(f"  Chart info found but no app name extracted, using fallback: {app_name_fallback}")
-                mappings[app_name_fallback] = chart_info_list
-                print(f"  ✓ Added fallback mapping: {app_name_fallback}")
+                app_name = base_name.replace('-', '').replace('_', '')
+                print(f"  Chart info found but no app name extracted, using fallback: {app_name}")
+            
+            print(f"  Found {len(chart_info_list)} charts for app: {app_name}")
+            
+            if app_name in mappings:
+                # Same app defined in two template dirs - keep both dirs' charts, but
+                # don't list the same chart twice.
+                print(f"  ⚠ {app_name} already has a mapping, merging charts")
+                seen = {(c.get('chart_name'), c.get('repo_url')) for c in mappings[app_name]}
+                added = [c for c in chart_info_list
+                         if (c.get('chart_name'), c.get('repo_url')) not in seen]
+                mappings[app_name].extend(added)
+                print(f"  ✓ Merged mapping: {app_name} (+{len(added)} new charts)")
             else:
-                print(f"  ✗ Could not extract chart info or app name from {template_file.name}")
+                mappings[app_name] = chart_info_list
+                print(f"  ✓ Added mapping: {app_name}")
+
+    def build_chart_mappings(self, repo_path: str) -> Dict[str, List[Dict]]:
+        """Build mappings between app names and their chart information"""
+        mappings = {}
+        found_any_dir = False
+        
+        for rel_dir in self.TEMPLATE_DIRS:
+            templates_dir = os.path.join(repo_path, rel_dir)
+            
+            if not os.path.exists(templates_dir):
+                print(f"Skipping missing templates directory: {rel_dir}")
+                continue
+            
+            found_any_dir = True
+            print(f"\nParsing Argo Application templates from: {rel_dir}")
+            self.parse_templates_dir(templates_dir, mappings)
+        
+        if not found_any_dir:
+            print(f"Error: no Argo Application template directories found "
+                  f"(looked for: {', '.join(self.TEMPLATE_DIRS)})")
+            return mappings
         
         print(f"\nFinal mappings built: {len(mappings)} entries")
         for app, chart_list in mappings.items():
@@ -309,6 +571,133 @@ class HelmChartTracker:
         
         return mappings
     
+    SEMVER_PATTERN = re.compile(
+        r'^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$')
+
+    @classmethod
+    def semver_key(cls, version: str):
+        """Sort key for a semver chart version, or None if it isn't semver
+        
+        Ranks a release above its own prereleases (1.20.0 > 1.20.0-rc.1).
+        """
+        match = cls.SEMVER_PATTERN.match(str(version).strip())
+        if not match:
+            return None
+        
+        major, minor, patch, prerelease = match.groups()
+        
+        if prerelease is None:
+            # Any release outranks every prerelease of the same version
+            prerelease_key = (1,)
+        else:
+            parts = []
+            for part in prerelease.split('.'):
+                # Numeric identifiers sort below alphanumeric ones, per semver
+                parts.append((0, int(part), '') if part.isdigit() else (1, 0, part))
+            prerelease_key = (0, tuple(parts))
+        
+        return (int(major), int(minor), int(patch), prerelease_key)
+
+    @classmethod
+    def select_latest_version(cls, versions: List[str]) -> Optional[str]:
+        """Pick the highest stable version, ignoring prereleases unless that's all there is
+        
+        Mirrors `helm search repo`, which hides prereleases without --devel. Without this an
+        OCI tag like 1.21.0-pre.0 would be reported as the latest cilium release.
+        """
+        parsed = [(cls.semver_key(v), v) for v in versions]
+        parsed = [(key, v) for key, v in parsed if key is not None]
+        
+        if not parsed:
+            return None
+        
+        # key[3][0] == 1 means "not a prerelease"
+        stable = [(key, v) for key, v in parsed if key[3][0] == 1]
+        return max(stable or parsed)[1]
+
+    def fetch_oci_token(self, session, challenge: str, repository: str) -> Optional[str]:
+        """Get an anonymous pull token from a registry's WWW-Authenticate challenge"""
+        if not challenge.lower().startswith('bearer '):
+            return None
+        
+        params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+        realm = params.get('realm')
+        if not realm:
+            return None
+        
+        query = {'scope': params.get('scope') or f'repository:{repository}:pull'}
+        if params.get('service'):
+            query['service'] = params['service']
+        
+        response = session.get(realm, params=query, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get('token') or payload.get('access_token')
+
+    def fetch_oci_tags(self, host: str, repository: str) -> List[str]:
+        """List every tag for an OCI repository, following pagination"""
+        session = requests.Session()
+        headers = {}
+        url = f"https://{host}/v2/{repository}/tags/list"
+        tags = []
+        
+        # Bounded so a registry with a broken Link header can't loop forever
+        for _ in range(20):
+            response = session.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 401 and 'Authorization' not in headers:
+                token = self.fetch_oci_token(
+                    session, response.headers.get('WWW-Authenticate', ''), repository)
+                if not token:
+                    response.raise_for_status()
+                headers['Authorization'] = f'Bearer {token}'
+                continue
+            
+            response.raise_for_status()
+            tags.extend(response.json().get('tags') or [])
+            
+            # Registries paginate with a Link: <...>; rel="next" header
+            link = response.headers.get('Link', '')
+            next_match = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link)
+            if not next_match:
+                break
+            url = urljoin(f"https://{host}", next_match.group(1))
+        
+        return tags
+
+    def get_latest_oci_chart_version(self, chart_name: str, repo_url: str) -> Optional[str]:
+        """Get the latest chart version from an OCI registry
+        
+        OCI registries have no index.yaml; the chart's versions are its image tags.
+        """
+        location = repo_url.split('://', 1)[-1].strip('/')
+        host, _, repository = location.partition('/')
+        
+        if not host or not repository:
+            print(f"    ✗ Could not parse OCI reference: {repo_url}")
+            return None
+        
+        # Templates write OCI sources both ways: repoURL may already end with the chart
+        # (oci://quay.io/cilium/charts/cilium + chart: cilium), or name only the namespace
+        # (ghcr.io/deliveryhero/helm-charts + chart: node-problem-detector).
+        if repository.rsplit('/', 1)[-1] != chart_name:
+            repository = f"{repository}/{chart_name}"
+        
+        print(f"    Listing OCI tags from: https://{host}/v2/{repository}/tags/list")
+        tags = self.fetch_oci_tags(host, repository)
+        
+        if not tags:
+            print(f"    ✗ No tags returned for {repository}")
+            return None
+        
+        version = self.select_latest_version(tags)
+        if version is None:
+            print(f"    ✗ No semver tags among {len(tags)} tags for {repository}")
+            return None
+        
+        print(f"    ✓ Latest version: {version} (from {len(tags)} tags)")
+        return version
+
     def get_latest_chart_version(self, chart_name: str, repo_url: str) -> Optional[str]:
         """Get the latest version of a chart from its repository (with caching)"""
         
@@ -321,6 +710,13 @@ class HelmChartTracker:
                 return cached_version
         
         try:
+            # OCI registries have no index.yaml - the versions are the image tags
+            if self.is_oci_repo_url(repo_url):
+                version = self.get_latest_oci_chart_version(chart_name, repo_url)
+                with self.cache_lock:
+                    self.version_cache[cache_key] = version
+                return version
+            
             # For Helm repositories, fetch the index.yaml
             if repo_url.endswith('/'):
                 index_url = f"{repo_url}index.yaml"
@@ -331,13 +727,27 @@ class HelmChartTracker:
             response = requests.get(index_url, timeout=30)  # Increased timeout
             response.raise_for_status()
             
-            index_data = yaml.safe_load(response.text)
+            # Parse the raw bytes, not response.text: Helm repos commonly serve
+            # index.yaml as `text/yaml` with no charset, and requests then falls back to
+            # ISO-8859-1 per the HTTP spec. That turns UTF-8 release notes into Latin-1
+            # C1 control characters, which PyYAML rejects ("unacceptable character
+            # #x0080"). PyYAML handles the encoding itself when given bytes.
+            index_data = yaml.safe_load(response.content) or {}
             entries = index_data.get('entries', {})
             
             if chart_name in entries:
-                # Get the latest version (first in the list, sorted by version desc)
-                latest_entry = entries[chart_name][0]
-                version = latest_entry.get('version')
+                # index.yaml is conventionally sorted newest-first, but merged or
+                # hand-edited indexes aren't reliably ordered, and the newest entry may be
+                # a prerelease. Pick explicitly instead of trusting position.
+                chart_versions = [entry.get('version') for entry in entries[chart_name]
+                                  if entry.get('version')]
+                version = self.select_latest_version(chart_versions)
+                
+                if version is None:
+                    # Nothing parsed as semver; fall back to the index's own ordering
+                    version = chart_versions[0] if chart_versions else None
+                    print(f"    ⚠ No semver versions for {chart_name}, using first entry")
+                
                 print(f"    ✓ Latest version: {version}")
                 
                 # Cache the result (thread-safe)
@@ -360,6 +770,8 @@ class HelmChartTracker:
             print(f"    ✗ Request failed for {repo_url}: {e}")
         except yaml.YAMLError as e:
             print(f"    ✗ Failed to parse YAML from {repo_url}: {e}")
+        except UnicodeDecodeError as e:
+            print(f"    ✗ index.yaml from {repo_url} is not valid UTF-8: {e}")
         except Exception as e:
             print(f"    ✗ Unexpected error for {chart_name} from {repo_url}: {e}")
         
@@ -369,7 +781,11 @@ class HelmChartTracker:
         return None
 
     def fetch_versions_parallel(self, charts_to_check: List[Tuple]) -> Dict:
-        """Fetch multiple chart versions in parallel"""
+        """Fetch multiple chart versions in parallel
+        
+        Results are keyed by (chart_name, repo_url) so two apps sharing a release name
+        can't overwrite each other's version.
+        """
         print(f"  Starting parallel version checks for {len(charts_to_check)} charts...")
         
         version_results = {}
@@ -378,10 +794,10 @@ class HelmChartTracker:
             chart_name, repo_url, display_name = chart_tuple
             try:
                 version = self.get_latest_chart_version(chart_name, repo_url)
-                return (display_name, version)
+                return ((chart_name, repo_url), version)
             except Exception as e:
                 print(f"    ✗ Error checking {display_name}: {e}")
-                return (display_name, None)
+                return ((chart_name, repo_url), None)
         
         # Use ThreadPoolExecutor for parallel requests
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -394,12 +810,12 @@ class HelmChartTracker:
             # Collect results as they complete
             for future in concurrent.futures.as_completed(future_to_chart):
                 try:
-                    display_name, version = future.result()
-                    version_results[display_name] = version
+                    chart_key, version = future.result()
+                    version_results[chart_key] = version
                 except Exception as e:
                     chart_tuple = future_to_chart[future]
                     print(f"    ✗ Failed to get version for {chart_tuple[2]}: {e}")
-                    version_results[chart_tuple[2]] = None
+                    version_results[(chart_tuple[0], chart_tuple[1])] = None
         
         print(f"  ✓ Completed parallel version checks")
         return version_results
@@ -418,27 +834,34 @@ class HelmChartTracker:
             for cluster in self.clusters:
                 print(f"Analyzing cluster: {cluster}")
                 
-                # Parse current versions from cluster's infraapps file
-                cluster_apps = self.parse_cluster_infraapps(temp_dir, cluster)
+                # Parse current versions from every one of the cluster's app files
+                cluster_apps = self.parse_cluster_apps(temp_dir, cluster)
                 
-                # Collect all charts that need version checking
-                charts_to_check = []
+                # Collect all charts that need version checking, deduped by
+                # (chart_name, repo_url) so shared charts are fetched once
+                charts_to_check = {}
                 cluster_chart_info = []
                 
-                for app_name, version_info in cluster_apps.items():
+                for app_name, version_info, source in cluster_apps:
                     current_version = version_info['chartVersion']
+                    class_name = version_info.get('className')
                     
                     # Get chart information from mappings
                     chart_mapping_list = chart_mappings.get(app_name, [])
                     
                     if not chart_mapping_list:
+                        print(f"  ⚠ No Argo template maps app '{app_name}' to a chart. "
+                              f"Check that a template under {', '.join(self.TEMPLATE_DIRS)} "
+                              f"references .Values.apps.{app_name}.enable")
                         # No mapping found - create entry without repo info
                         chart_info = ChartInfo(
-                            name=app_name,
+                            name=self.release_display_name(app_name, class_name),
                             cluster=cluster,
                             current_version=current_version,
                             repo_url=None,
-                            chart_name=None
+                            chart_name=None,
+                            source=source,
+                            class_name=class_name
                         )
                         cluster_chart_info.append(chart_info)
                         continue
@@ -449,11 +872,12 @@ class HelmChartTracker:
                         chart_name = chart_mapping.get('chart_name')
                         release_name = chart_mapping.get('release_name', chart_name)
                         
-                        # Use release name as the display name
-                        display_name = release_name
+                        # Use release name as the display name, qualified by class so
+                        # external/internal releases stay distinct
+                        display_name = self.release_display_name(release_name, class_name)
                         
                         # Determine which version to use based on the chart
-                        if 'policies' in chart_name.lower() and 'policiesChartVersion' in version_info:
+                        if 'policies' in chart_name.lower() and version_info.get('policiesChartVersion'):
                             # Use policies version for policy charts
                             chart_version = version_info['policiesChartVersion']
                             print(f"  Using policies version {chart_version} for {display_name}")
@@ -466,26 +890,33 @@ class HelmChartTracker:
                             cluster=cluster,
                             current_version=chart_version,
                             repo_url=repo_url,
-                            chart_name=chart_name
+                            chart_name=chart_name,
+                            source=source,
+                            class_name=class_name
                         )
                         
-                        # Add to list for parallel checking if we have repo info
+                        # Queue for parallel checking if we have repo info
                         if repo_url and chart_name:
-                            charts_to_check.append((chart_name, repo_url, display_name))
+                            charts_to_check[(chart_name, repo_url)] = display_name
                         
                         cluster_chart_info.append(chart_info)
                 
                 # Fetch all versions in parallel
                 if charts_to_check:
-                    version_results = self.fetch_versions_parallel(charts_to_check)
+                    version_results = self.fetch_versions_parallel(
+                        [(chart_name, repo_url, display_name)
+                         for (chart_name, repo_url), display_name in charts_to_check.items()]
+                    )
                     
                     # Update chart info with results
                     for chart_info in cluster_chart_info:
-                        if chart_info.name in version_results:
-                            latest_version = version_results[chart_info.name]
+                        chart_key = (chart_info.chart_name, chart_info.repo_url)
+                        if chart_key in version_results:
+                            latest_version = version_results[chart_key]
                             chart_info.latest_version = latest_version
-                            chart_info.needs_update = (latest_version and 
-                                                     chart_info.current_version != latest_version)
+                            chart_info.needs_update = bool(
+                                latest_version and
+                                chart_info.current_version != latest_version)
                 
                 # Add all charts from this cluster
                 charts.extend(cluster_chart_info)
@@ -495,6 +926,25 @@ class HelmChartTracker:
             
             return charts
     
+    @staticmethod
+    def release_display_name(name: str, class_name: str = None) -> str:
+        """Qualify a release name with its class, e.g. 'traefik (internal)'"""
+        return f"{name} ({class_name})" if class_name else name
+
+    @staticmethod
+    def no_version_reason(chart: ChartInfo) -> Optional[str]:
+        """Why a chart has no latest version, or None if it resolved fine"""
+        if chart.latest_version:
+            return None
+        if not chart.repo_url:
+            return "No chart mapping found in Argo templates"
+        return "Failed to fetch latest version"
+
+    @staticmethod
+    def source_tag(chart: ChartInfo) -> str:
+        """Short suffix identifying which app file a chart came from"""
+        return f" [{chart.source}]" if chart.source else ""
+
     def generate_report(self, charts: List[ChartInfo]) -> str:
         """Generate a human-readable report organized by cluster"""
         report = []
@@ -513,6 +963,8 @@ class HelmChartTracker:
         report.append(f"  Need updates: {updates_needed}")
         report.append(f"  Up-to-date: {up_to_date}")
         report.append(f"  No version info: {no_info}")
+        for source, _ in self.APP_SOURCES:
+            report.append(f"  From {source}: {len([c for c in charts if c.source == source])}")
         report.append("")
         
         # Group by cluster
@@ -529,7 +981,8 @@ class HelmChartTracker:
             if cluster_updates:
                 report.append(f"  📈 Updates needed ({len(cluster_updates)}):")
                 for chart in cluster_updates:
-                    report.append(f"    {chart.name}: {chart.current_version} → {chart.latest_version}")
+                    report.append(f"    {chart.name}{self.source_tag(chart)}: "
+                                  f"{chart.current_version} → {chart.latest_version}")
                 report.append("")
             
             # Up to date charts in this cluster
@@ -537,7 +990,7 @@ class HelmChartTracker:
             if cluster_ok:
                 report.append(f"  ✅ Up-to-date ({len(cluster_ok)}):")
                 for chart in cluster_ok:
-                    report.append(f"    {chart.name}: {chart.current_version}")
+                    report.append(f"    {chart.name}{self.source_tag(chart)}: {chart.current_version}")
                 report.append("")
             
             # Charts without version info
@@ -545,8 +998,9 @@ class HelmChartTracker:
             if cluster_no_info:
                 report.append(f"  ❓ No version info ({len(cluster_no_info)}):")
                 for chart in cluster_no_info:
-                    reason = "No mapping found" if not chart.repo_url else "Failed to fetch"
-                    report.append(f"    {chart.name}: {chart.current_version} ({reason})")
+                    reason = self.no_version_reason(chart)
+                    report.append(f"    {chart.name}{self.source_tag(chart)}: "
+                                  f"{chart.current_version} ({reason})")
                 report.append("")
         
         return "\n".join(report)
@@ -562,7 +1016,9 @@ class HelmChartTracker:
                     'total_charts': len(cluster_charts),
                     'needs_update': len([c for c in cluster_charts if c.needs_update]),
                     'up_to_date': len([c for c in cluster_charts if not c.needs_update and c.latest_version]),
-                    'no_version_info': len([c for c in cluster_charts if not c.latest_version])
+                    'no_version_info': len([c for c in cluster_charts if not c.latest_version]),
+                    'by_source': {source: len([c for c in cluster_charts if c.source == source])
+                                  for source, _ in self.APP_SOURCES}
                 },
                 'charts': [
                     {
@@ -571,7 +1027,10 @@ class HelmChartTracker:
                         'latest_version': chart.latest_version,
                         'needs_update': chart.needs_update,
                         'repo_url': chart.repo_url,
-                        'chart_name': chart.chart_name
+                        'chart_name': chart.chart_name,
+                        'source': chart.source,
+                        'class_name': chart.class_name,
+                        'no_version_reason': self.no_version_reason(chart)
                     }
                     for chart in cluster_charts
                 ]
@@ -583,20 +1042,94 @@ class HelmChartTracker:
                 'total_charts': len(charts),
                 'needs_update': len([c for c in charts if c.needs_update]),
                 'up_to_date': len([c for c in charts if not c.needs_update and c.latest_version]),
-                'no_version_info': len([c for c in charts if not c.latest_version])
+                'no_version_info': len([c for c in charts if not c.latest_version]),
+                'by_source': {source: len([c for c in charts if c.source == source])
+                              for source, _ in self.APP_SOURCES}
             },
             'clusters': clusters_data
         }
 
+CLUSTERS_ENV_VAR = 'CLUSTERS'
+
+
+def split_cluster_names(values: List[str]) -> List[str]:
+    """Flatten repeated and/or comma-separated cluster values into a clean list"""
+    return [name.strip() for entry in values
+            for name in entry.split(',') if name.strip()]
+
+
+def validate_clusters(names: List[str]) -> List[str]:
+    """Reject cluster names that aren't part of the known set"""
+    unknown = [c for c in names if c not in HelmChartTracker.DEFAULT_CLUSTERS]
+    if unknown:
+        raise ValueError("unknown cluster(s): %s (known: %s)"
+                         % (', '.join(unknown), ', '.join(HelmChartTracker.DEFAULT_CLUSTERS)))
+    return names
+
+
+def clusters_from_env() -> Optional[List[str]]:
+    """Read the cluster selection from the CLUSTERS environment variable"""
+    raw = os.getenv(CLUSTERS_ENV_VAR)
+    if not raw:
+        return None
+
+    names = split_cluster_names([raw])
+    if not names:
+        return None
+
+    return validate_clusters(names)
+
+
+def parse_args(argv: List[str] = None):
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Compare Helm chart versions across clusters with the latest available versions"
+    )
+    parser.add_argument(
+        '-c', '--cluster',
+        action='append',
+        dest='clusters',
+        metavar='NAME',
+        help=("Only analyze this cluster. Repeat the flag or use a comma-separated "
+              "list to select several. Overrides the %s environment variable. "
+              "Default: %s" % (CLUSTERS_ENV_VAR, ', '.join(HelmChartTracker.DEFAULT_CLUSTERS)))
+    )
+    parser.add_argument(
+        '--repo-url',
+        default=os.getenv('GIT_REPO_URL', "git@github.com:NCAR/cisl-cloud-charts.git"),
+        help="Git repository to analyze (default: %(default)s)"
+    )
+    parser.add_argument(
+        '--ssh-key-path',
+        default=os.getenv('SSH_KEY_PATH', "~/.ssh/id_rsa"),
+        help="Path to the SSH private key used for the clone (default: %(default)s)"
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        if args.clusters:
+            # Flatten any comma-separated values, e.g. --cluster mlc1,nwc3
+            args.clusters = validate_clusters(split_cluster_names(args.clusters))
+        else:
+            # Fall back to the environment, so `docker run -e CLUSTERS=mlc1` works
+            args.clusters = clusters_from_env()
+    except ValueError as e:
+        parser.error(str(e))
+
+    return args
+
+
 def main():
     """Example usage"""
-    # Update these values for your setup
+    args = parse_args()
+
     tracker = HelmChartTracker(
-        git_repo_url="git@github.com:NCAR/cisl-cloud-charts.git",
-        ssh_key_path="~/.ssh/id_rsa"  # Path to your SSH private key
+        git_repo_url=args.repo_url,
+        ssh_key_path=args.ssh_key_path,  # Path to your SSH private key
+        clusters=args.clusters
     )
     
-    print("Analyzing Helm charts across clusters...")
+    print("Analyzing Helm charts across clusters: %s" % ', '.join(tracker.clusters))
     charts = tracker.analyze_charts()
     
     if charts:

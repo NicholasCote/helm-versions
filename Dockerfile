@@ -30,6 +30,7 @@ EXPOSE 5000
 ENV FLASK_APP=app.py
 ENV PYTHONPATH=/app
 ENV PORT=5000
+ENV PYTHONUNBUFFERED=1
 
 # Run the application
 CMD ["python", "app.py"]
