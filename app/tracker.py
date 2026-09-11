@@ -11,14 +11,20 @@ import yaml
 import requests
 import subprocess
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
-import shutil
 import re
 import concurrent.futures
 import threading
 from urllib.parse import urljoin
+
+from chartrefs import is_helm_repo_url, is_oci_repo_url, oci_chart_location
+from staleness import (
+    NEEDS_UPDATE_TIERS, SEMVER_PATTERN, TIER_ICONS, TIER_LABELS, TIER_ORDER,
+    Staleness, classify_staleness, resolve_latest, select_latest_version,
+    semver_key, staleness_thresholds_from_env,
+)
 
 @dataclass
 class ChartInfo:
@@ -31,10 +37,34 @@ class ChartInfo:
     needs_update: bool = False
     source: str = None  # Which cluster app file this came from
     class_name: str = None  # Ingress class (external/internal) for apps with a class list
-    
+    release_name: str = None  # Helm release name, so both sides of a diff render alike
+    # Every version the chart's repo publishes, used to count how many releases behind
+    # this pin is. Deliberately not included in the dashboard JSON - see api/versions.
+    available_versions: List[str] = field(default_factory=list)
+    staleness: Staleness = None
+    staleness_thresholds: dict = None
+
     def __post_init__(self):
-        if self.latest_version and self.current_version != self.latest_version:
-            self.needs_update = True
+        # Charts with no Argo mapping never get apply_versions() called, so classify
+        # here too - they land in the 'unknown' tier.
+        if self.staleness is None:
+            self.recompute_staleness()
+
+    def recompute_staleness(self):
+        self.staleness = classify_staleness(
+            self.current_version, self.latest_version, self.available_versions,
+            self.staleness_thresholds)
+        self.needs_update = self.staleness.tier in NEEDS_UPDATE_TIERS
+
+    def apply_versions(self, versions: List[str]):
+        """Attach a freshly fetched version list, then re-derive latest + staleness
+
+        The single place latest_version/needs_update/staleness are computed from a
+        fetch result, so the three can't drift apart.
+        """
+        self.available_versions = list(versions or [])
+        self.latest_version = resolve_latest(self.available_versions)
+        self.recompute_staleness()
 
 class HelmChartTracker:
     DEFAULT_CLUSTERS = ['mgmt', 'nwc1', 'mlc1', 'nwc3', 'mlc3']
@@ -65,8 +95,11 @@ class HelmChartTracker:
         self.ssh_key_path = ssh_key_path
         self.clusters = list(clusters) if clusters else list(self.DEFAULT_CLUSTERS)
         self.chart_mappings = {}  # Maps app names to chart info
-        self.version_cache = {}  # Cache for chart versions: {(chart_name, repo_url): version}
+        # Every version a chart publishes: {(chart_name, repo_url): [version, ...]}.
+        # An empty list is a cached failure, so a miss isn't retried within a run.
+        self.version_cache = {}
         self.cache_lock = threading.Lock()  # Thread safety for cache
+        self.staleness_thresholds = staleness_thresholds_from_env()
         
     def setup_git_ssh(self):
         """Setup SSH configuration for private repository access"""
@@ -415,33 +448,12 @@ class HelmChartTracker:
             'release_name': release_name
         }
 
-    @staticmethod
-    def is_helm_repo_url(repo_url: str) -> bool:
-        """True for HTTP(S) chart repos and OCI registries, False for git sources"""
-        if repo_url.startswith(('http://', 'https://')):
-            # A git repo served over https still isn't a chart repo
-            return not repo_url.endswith('.git')
-        
-        if repo_url.startswith('oci://'):
-            return True
-        
-        if repo_url.startswith(('git@', 'ssh://', 'git://')):
-            return False
-        
-        # Argo also accepts a scheme-less OCI reference (ghcr.io/deliveryhero/helm-charts).
-        # Treat the first segment as a registry if it looks like a host, the same way
-        # container tooling distinguishes a registry from a bare repository name.
-        host = repo_url.split('/', 1)[0]
-        return '.' in host or ':' in host or host == 'localhost'
-
-    @classmethod
-    def is_oci_repo_url(cls, repo_url: str) -> bool:
-        """True for OCI registry references, with or without the oci:// scheme"""
-        if repo_url.startswith('oci://'):
-            return True
-        if repo_url.startswith(('http://', 'https://')):
-            return False
-        return cls.is_helm_repo_url(repo_url)
+    # Chart-location rules live in chartrefs.py so differ.py can share them without
+    # pulling in yaml/requests. Re-exposed here because they were part of this
+    # class's surface.
+    is_helm_repo_url = staticmethod(is_helm_repo_url)
+    is_oci_repo_url = staticmethod(is_oci_repo_url)
+    oci_chart_location = staticmethod(oci_chart_location)
 
     def parse_argo_application_regex(self, content: str) -> List[Dict[str, str]]:
         """Best-effort fallback for templates that won't parse as YAML"""
@@ -571,49 +583,11 @@ class HelmChartTracker:
         
         return mappings
     
-    SEMVER_PATTERN = re.compile(
-        r'^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$')
-
-    @classmethod
-    def semver_key(cls, version: str):
-        """Sort key for a semver chart version, or None if it isn't semver
-        
-        Ranks a release above its own prereleases (1.20.0 > 1.20.0-rc.1).
-        """
-        match = cls.SEMVER_PATTERN.match(str(version).strip())
-        if not match:
-            return None
-        
-        major, minor, patch, prerelease = match.groups()
-        
-        if prerelease is None:
-            # Any release outranks every prerelease of the same version
-            prerelease_key = (1,)
-        else:
-            parts = []
-            for part in prerelease.split('.'):
-                # Numeric identifiers sort below alphanumeric ones, per semver
-                parts.append((0, int(part), '') if part.isdigit() else (1, 0, part))
-            prerelease_key = (0, tuple(parts))
-        
-        return (int(major), int(minor), int(patch), prerelease_key)
-
-    @classmethod
-    def select_latest_version(cls, versions: List[str]) -> Optional[str]:
-        """Pick the highest stable version, ignoring prereleases unless that's all there is
-        
-        Mirrors `helm search repo`, which hides prereleases without --devel. Without this an
-        OCI tag like 1.21.0-pre.0 would be reported as the latest cilium release.
-        """
-        parsed = [(cls.semver_key(v), v) for v in versions]
-        parsed = [(key, v) for key, v in parsed if key is not None]
-        
-        if not parsed:
-            return None
-        
-        # key[3][0] == 1 means "not a prerelease"
-        stable = [(key, v) for key, v in parsed if key[3][0] == 1]
-        return max(stable or parsed)[1]
+    # Semver parsing lives in staleness.py so it can be tested without Flask/YAML.
+    # Re-exposed here because these were part of this class's surface.
+    SEMVER_PATTERN = SEMVER_PATTERN
+    semver_key = staticmethod(semver_key)
+    select_latest_version = staticmethod(select_latest_version)
 
     def fetch_oci_token(self, session, challenge: str, repository: str) -> Optional[str]:
         """Get an anonymous pull token from a registry's WWW-Authenticate challenge"""
@@ -665,58 +639,65 @@ class HelmChartTracker:
         
         return tags
 
-    def get_latest_oci_chart_version(self, chart_name: str, repo_url: str) -> Optional[str]:
-        """Get the latest chart version from an OCI registry
-        
+    def fetch_oci_chart_versions(self, chart_name: str, repo_url: str) -> List[str]:
+        """Every version an OCI registry publishes for a chart
+
         OCI registries have no index.yaml; the chart's versions are its image tags.
         """
-        location = repo_url.split('://', 1)[-1].strip('/')
-        host, _, repository = location.partition('/')
-        
-        if not host or not repository:
+        location = self.oci_chart_location(chart_name, repo_url)
+
+        if not location:
             print(f"    ✗ Could not parse OCI reference: {repo_url}")
-            return None
-        
-        # Templates write OCI sources both ways: repoURL may already end with the chart
-        # (oci://quay.io/cilium/charts/cilium + chart: cilium), or name only the namespace
-        # (ghcr.io/deliveryhero/helm-charts + chart: node-problem-detector).
-        if repository.rsplit('/', 1)[-1] != chart_name:
-            repository = f"{repository}/{chart_name}"
-        
+            return []
+
+        host, _, repository = location.partition('/')
+
         print(f"    Listing OCI tags from: https://{host}/v2/{repository}/tags/list")
         tags = self.fetch_oci_tags(host, repository)
-        
+
         if not tags:
             print(f"    ✗ No tags returned for {repository}")
-            return None
-        
-        version = self.select_latest_version(tags)
-        if version is None:
-            print(f"    ✗ No semver tags among {len(tags)} tags for {repository}")
-            return None
-        
-        print(f"    ✓ Latest version: {version} (from {len(tags)} tags)")
-        return version
+            return []
 
-    def get_latest_chart_version(self, chart_name: str, repo_url: str) -> Optional[str]:
-        """Get the latest version of a chart from its repository (with caching)"""
-        
-        # Check cache first (thread-safe)
+        version = resolve_latest(tags)
+        if select_latest_version(tags) is None:
+            print(f"    ✗ No semver tags among {len(tags)} tags for {repository}")
+        else:
+            print(f"    ✓ Latest version: {version} (from {len(tags)} tags)")
+
+        return tags
+
+    def get_chart_versions(self, chart_name: str, repo_url: str) -> List[str]:
+        """Every version a chart's repository publishes, newest-first-ish (with caching)
+
+        The full list rather than just the latest, because staleness is measured in
+        *released versions* between the pin and the latest - a chart can jump 1.2.0 to
+        1.2.10 in two releases - and because the diff view offers it as a version picker.
+        """
         cache_key = (chart_name, repo_url)
         with self.cache_lock:
             if cache_key in self.version_cache:
-                cached_version = self.version_cache[cache_key]
-                print(f"    ✓ Using cached version: {cached_version}")
-                return cached_version
-        
+                cached = self.version_cache[cache_key]
+                print(f"    ✓ Using {len(cached)} cached versions")
+                return cached
+
+        if self.is_oci_repo_url(repo_url):
+            versions = self.fetch_oci_chart_versions(chart_name, repo_url)
+        else:
+            versions = self.fetch_http_chart_versions(chart_name, repo_url)
+
+        # An empty list is a cached failure: a miss isn't retried within a run.
+        with self.cache_lock:
+            self.version_cache[cache_key] = versions
+        return versions
+
+    def get_latest_chart_version(self, chart_name: str, repo_url: str) -> Optional[str]:
+        """The latest version of a chart, for callers that don't need the whole list"""
+        return resolve_latest(self.get_chart_versions(chart_name, repo_url))
+
+    def fetch_http_chart_versions(self, chart_name: str, repo_url: str) -> List[str]:
+        """Every version an HTTP(S) Helm repository lists for a chart, [] on any failure"""
         try:
-            # OCI registries have no index.yaml - the versions are the image tags
-            if self.is_oci_repo_url(repo_url):
-                version = self.get_latest_oci_chart_version(chart_name, repo_url)
-                with self.cache_lock:
-                    self.version_cache[cache_key] = version
-                return version
-            
             # For Helm repositories, fetch the index.yaml
             if repo_url.endswith('/'):
                 index_url = f"{repo_url}index.yaml"
@@ -741,28 +722,18 @@ class HelmChartTracker:
                 # a prerelease. Pick explicitly instead of trusting position.
                 chart_versions = [entry.get('version') for entry in entries[chart_name]
                                   if entry.get('version')]
-                version = self.select_latest_version(chart_versions)
-                
-                if version is None:
-                    # Nothing parsed as semver; fall back to the index's own ordering
-                    version = chart_versions[0] if chart_versions else None
+
+                if select_latest_version(chart_versions) is None:
                     print(f"    ⚠ No semver versions for {chart_name}, using first entry")
-                
-                print(f"    ✓ Latest version: {version}")
-                
-                # Cache the result (thread-safe)
-                with self.cache_lock:
-                    self.version_cache[cache_key] = version
-                return version
+                print(f"    ✓ Latest version: {resolve_latest(chart_versions)} "
+                      f"(from {len(chart_versions)} versions)")
+
+                return chart_versions
             else:
                 available_charts = list(entries.keys())
                 print(f"    ✗ Chart '{chart_name}' not found in repository.")
                 print(f"    Available charts: {available_charts[:10]}..." if len(available_charts) > 10 else f"    Available charts: {available_charts}")
-                
-                # Cache the negative result (thread-safe)
-                with self.cache_lock:
-                    self.version_cache[cache_key] = None
-                return None
+                return []
             
         except requests.exceptions.Timeout:
             print(f"    ✗ Timeout fetching from {repo_url}")
@@ -774,17 +745,14 @@ class HelmChartTracker:
             print(f"    ✗ index.yaml from {repo_url} is not valid UTF-8: {e}")
         except Exception as e:
             print(f"    ✗ Unexpected error for {chart_name} from {repo_url}: {e}")
-        
-        # Cache the error result (thread-safe)
-        with self.cache_lock:
-            self.version_cache[cache_key] = None
-        return None
 
-    def fetch_versions_parallel(self, charts_to_check: List[Tuple]) -> Dict:
-        """Fetch multiple chart versions in parallel
+        return []
+
+    def fetch_chart_versions_parallel(self, charts_to_check: List[Tuple]) -> Dict:
+        """Fetch multiple charts' version lists in parallel
         
         Results are keyed by (chart_name, repo_url) so two apps sharing a release name
-        can't overwrite each other's version.
+        can't overwrite each other's versions.
         """
         print(f"  Starting parallel version checks for {len(charts_to_check)} charts...")
         
@@ -793,11 +761,11 @@ class HelmChartTracker:
         def fetch_single_version(chart_tuple):
             chart_name, repo_url, display_name = chart_tuple
             try:
-                version = self.get_latest_chart_version(chart_name, repo_url)
-                return ((chart_name, repo_url), version)
+                versions = self.get_chart_versions(chart_name, repo_url)
+                return ((chart_name, repo_url), versions)
             except Exception as e:
                 print(f"    ✗ Error checking {display_name}: {e}")
-                return ((chart_name, repo_url), None)
+                return ((chart_name, repo_url), [])
         
         # Use ThreadPoolExecutor for parallel requests
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -815,7 +783,7 @@ class HelmChartTracker:
                 except Exception as e:
                     chart_tuple = future_to_chart[future]
                     print(f"    ✗ Failed to get version for {chart_tuple[2]}: {e}")
-                    version_results[(chart_tuple[0], chart_tuple[1])] = None
+                    version_results[(chart_tuple[0], chart_tuple[1])] = []
         
         print(f"  ✓ Completed parallel version checks")
         return version_results
@@ -861,7 +829,8 @@ class HelmChartTracker:
                             repo_url=None,
                             chart_name=None,
                             source=source,
-                            class_name=class_name
+                            class_name=class_name,
+                            staleness_thresholds=self.staleness_thresholds
                         )
                         cluster_chart_info.append(chart_info)
                         continue
@@ -892,7 +861,9 @@ class HelmChartTracker:
                             repo_url=repo_url,
                             chart_name=chart_name,
                             source=source,
-                            class_name=class_name
+                            class_name=class_name,
+                            release_name=release_name,
+                            staleness_thresholds=self.staleness_thresholds
                         )
                         
                         # Queue for parallel checking if we have repo info
@@ -903,7 +874,7 @@ class HelmChartTracker:
                 
                 # Fetch all versions in parallel
                 if charts_to_check:
-                    version_results = self.fetch_versions_parallel(
+                    version_results = self.fetch_chart_versions_parallel(
                         [(chart_name, repo_url, display_name)
                          for (chart_name, repo_url), display_name in charts_to_check.items()]
                     )
@@ -912,11 +883,7 @@ class HelmChartTracker:
                     for chart_info in cluster_chart_info:
                         chart_key = (chart_info.chart_name, chart_info.repo_url)
                         if chart_key in version_results:
-                            latest_version = version_results[chart_key]
-                            chart_info.latest_version = latest_version
-                            chart_info.needs_update = bool(
-                                latest_version and
-                                chart_info.current_version != latest_version)
+                            chart_info.apply_versions(version_results[chart_key])
                 
                 # Add all charts from this cluster
                 charts.extend(cluster_chart_info)
@@ -930,6 +897,18 @@ class HelmChartTracker:
     def release_display_name(name: str, class_name: str = None) -> str:
         """Qualify a release name with its class, e.g. 'traefik (internal)'"""
         return f"{name} ({class_name})" if class_name else name
+
+    @classmethod
+    def describe_versions(cls, chart: ChartInfo) -> str:
+        """One line describing where a chart sits, e.g. `1.2.3 → 1.2.6 (3 releases behind)`"""
+        if not chart.latest_version:
+            return f"{chart.current_version} ({cls.no_version_reason(chart)})"
+        
+        if not chart.needs_update:
+            return f"{chart.current_version} ({chart.staleness.label})"
+        
+        return (f"{chart.current_version} → {chart.latest_version} "
+                f"({chart.staleness.label})")
 
     @staticmethod
     def no_version_reason(chart: ChartInfo) -> Optional[str]:
@@ -945,6 +924,23 @@ class HelmChartTracker:
         """Short suffix identifying which app file a chart came from"""
         return f" [{chart.source}]" if chart.source else ""
 
+    def summarize(self, charts: List[ChartInfo]) -> Dict:
+        """Counts for a set of charts, per tier and per source
+
+        by_tier['unknown'] can exceed no_version_info: it also counts charts whose
+        latest version resolved but isn't semver-comparable.
+        """
+        return {
+            'total_charts': len(charts),
+            'needs_update': len([c for c in charts if c.needs_update]),
+            'up_to_date': len([c for c in charts if not c.needs_update and c.latest_version]),
+            'no_version_info': len([c for c in charts if not c.latest_version]),
+            'by_tier': {tier: len([c for c in charts if c.staleness.tier == tier])
+                        for tier in TIER_ORDER},
+            'by_source': {source: len([c for c in charts if c.source == source])
+                          for source, _ in self.APP_SOURCES}
+        }
+
     def generate_report(self, charts: List[ChartInfo]) -> str:
         """Generate a human-readable report organized by cluster"""
         report = []
@@ -953,18 +949,17 @@ class HelmChartTracker:
         report.append("")
         
         # Overall summary
-        total_charts = len(charts)
-        updates_needed = len([c for c in charts if c.needs_update])
-        up_to_date = len([c for c in charts if not c.needs_update and c.latest_version])
-        no_info = len([c for c in charts if not c.latest_version])
+        summary = self.summarize(charts)
         
         report.append(f"📊 Overall Summary:")
-        report.append(f"  Total charts: {total_charts}")
-        report.append(f"  Need updates: {updates_needed}")
-        report.append(f"  Up-to-date: {up_to_date}")
-        report.append(f"  No version info: {no_info}")
+        report.append(f"  Total charts: {summary['total_charts']}")
+        report.append(f"  Need updates: {summary['needs_update']}")
+        for tier in TIER_ORDER:
+            count = summary['by_tier'][tier]
+            if count:
+                report.append(f"    {TIER_ICONS[tier]} {TIER_LABELS[tier]}: {count}")
         for source, _ in self.APP_SOURCES:
-            report.append(f"  From {source}: {len([c for c in charts if c.source == source])}")
+            report.append(f"  From {source}: {summary['by_source'][source]}")
         report.append("")
         
         # Group by cluster
@@ -976,31 +971,16 @@ class HelmChartTracker:
             report.append(f"🏢 Cluster: {cluster.upper()}")
             report.append("-" * 30)
             
-            # Charts needing updates in this cluster
-            cluster_updates = [c for c in cluster_charts if c.needs_update]
-            if cluster_updates:
-                report.append(f"  📈 Updates needed ({len(cluster_updates)}):")
-                for chart in cluster_updates:
+            # Grouped by staleness tier, most severe first, so the urgent work is on top
+            for tier in TIER_ORDER:
+                tier_charts = [c for c in cluster_charts if c.staleness.tier == tier]
+                if not tier_charts:
+                    continue
+                
+                report.append(f"  {TIER_ICONS[tier]} {TIER_LABELS[tier]} ({len(tier_charts)}):")
+                for chart in tier_charts:
                     report.append(f"    {chart.name}{self.source_tag(chart)}: "
-                                  f"{chart.current_version} → {chart.latest_version}")
-                report.append("")
-            
-            # Up to date charts in this cluster
-            cluster_ok = [c for c in cluster_charts if not c.needs_update and c.latest_version]
-            if cluster_ok:
-                report.append(f"  ✅ Up-to-date ({len(cluster_ok)}):")
-                for chart in cluster_ok:
-                    report.append(f"    {chart.name}{self.source_tag(chart)}: {chart.current_version}")
-                report.append("")
-            
-            # Charts without version info
-            cluster_no_info = [c for c in cluster_charts if not c.latest_version]
-            if cluster_no_info:
-                report.append(f"  ❓ No version info ({len(cluster_no_info)}):")
-                for chart in cluster_no_info:
-                    reason = self.no_version_reason(chart)
-                    report.append(f"    {chart.name}{self.source_tag(chart)}: "
-                                  f"{chart.current_version} ({reason})")
+                                  f"{self.describe_versions(chart)}")
                 report.append("")
         
         return "\n".join(report)
@@ -1012,42 +992,48 @@ class HelmChartTracker:
         for cluster in self.clusters:
             cluster_charts = [c for c in charts if c.cluster == cluster]
             clusters_data[cluster] = {
-                'summary': {
-                    'total_charts': len(cluster_charts),
-                    'needs_update': len([c for c in cluster_charts if c.needs_update]),
-                    'up_to_date': len([c for c in cluster_charts if not c.needs_update and c.latest_version]),
-                    'no_version_info': len([c for c in cluster_charts if not c.latest_version]),
-                    'by_source': {source: len([c for c in cluster_charts if c.source == source])
-                                  for source, _ in self.APP_SOURCES}
-                },
-                'charts': [
-                    {
-                        'name': chart.name,
-                        'current_version': chart.current_version,
-                        'latest_version': chart.latest_version,
-                        'needs_update': chart.needs_update,
-                        'repo_url': chart.repo_url,
-                        'chart_name': chart.chart_name,
-                        'source': chart.source,
-                        'class_name': chart.class_name,
-                        'no_version_reason': self.no_version_reason(chart)
-                    }
-                    for chart in cluster_charts
-                ]
+                'summary': self.summarize(cluster_charts),
+                'charts': [self.chart_payload(chart) for chart in cluster_charts]
             }
         
         # Overall summary
         return {
-            'summary': {
-                'total_charts': len(charts),
-                'needs_update': len([c for c in charts if c.needs_update]),
-                'up_to_date': len([c for c in charts if not c.needs_update and c.latest_version]),
-                'no_version_info': len([c for c in charts if not c.latest_version]),
-                'by_source': {source: len([c for c in charts if c.source == source])
-                              for source, _ in self.APP_SOURCES}
-            },
+            'summary': self.summarize(charts),
             'clusters': clusters_data
         }
+
+    def chart_payload(self, chart: ChartInfo) -> Dict:
+        """One chart as the dashboard consumes it
+
+        Note `available_versions` is deliberately absent: a few hundred charts times
+        OCI tag lists in the hundreds would make /api/charts multi-megabyte on every
+        poll. The diff view fetches it lazily from /api/versions instead.
+        """
+        return {
+            'name': chart.name,
+            'current_version': chart.current_version,
+            'latest_version': chart.latest_version,
+            'needs_update': chart.needs_update,
+            'repo_url': chart.repo_url,
+            'chart_name': chart.chart_name,
+            'release_name': chart.release_name,
+            'source': chart.source,
+            'class_name': chart.class_name,
+            'staleness_tier': chart.staleness.tier,
+            'staleness_label': chart.staleness.label,
+            'versions_behind': chart.staleness.releases_behind,
+            'no_version_reason': self.no_version_reason(chart)
+        }
+
+    @staticmethod
+    def version_index(charts: List[ChartInfo]) -> Dict:
+        """{(chart_name, repo_url): [versions]} for the diff view's version picker
+
+        Kept out of the dashboard payload but retained in memory, since analyze_charts
+        discards the tracker (and its cache) once a refresh finishes.
+        """
+        return {(c.chart_name, c.repo_url): c.available_versions
+                for c in charts if c.chart_name and c.repo_url and c.available_versions}
 
 CLUSTERS_ENV_VAR = 'CLUSTERS'
 
