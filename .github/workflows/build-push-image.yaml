@@ -1,0 +1,167 @@
+# Build the image on every push to main, then write the new tag into the Helm values so
+# the chart in git always names the image that was actually built from it.
+#
+# Templated from NCAR/cirrus-examples/github-workflows/build-push-image.yaml, with three
+# differences: the values-bump commit at the end, the guards that keep that commit from
+# triggering another build, and a GitHub-hosted runner instead of a self-hosted one.
+name: build and push
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      # The bump commit below only ever touches helm/. Ignoring that path is what stops
+      # this workflow triggering itself - belt to the [skip ci] braces on the commit.
+      # It also means a chart-only edit doesn't rebuild an image that hasn't changed.
+      - 'helm/**'
+      - '**.md'
+      - '.github/**'
+  workflow_dispatch:
+
+# One build at a time. Two concurrent runs would race on the values.yaml commit, and
+# the loser would be pushing a tag for an image that is no longer the newest.
+concurrency:
+  group: build-push-image
+  cancel-in-progress: false
+
+permissions:
+  contents: write         # needed to push the values.yaml bump back to main
+
+jobs:
+  build:
+    # GitHub-hosted. The example uses a self-hosted runner inside CIRRUS because that is
+    # what reaches the in-cluster buildkit service; this image is small and the repo is
+    # public, so neither is needed. That choice is why the buildx step below uses the
+    # default local driver rather than the remote one - a hosted runner cannot resolve
+    # buildkitd.arc-systems.svc, and the two settings have to move together.
+    #
+    # It does mean the push crosses the public internet to hub.k8s.ucar.edu, which
+    # resolves to a public UCAR address. If the registry ever gets a source-IP
+    # allowlist, this is the step that breaks and a self-hosted runner is the way back.
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+      with:
+        # Commit back to the branch this ran on, not the detached SHA.
+        ref: ${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+
+    # Short SHA is the image tag. Immutable per build, which is what makes
+    # imagePullPolicy: IfNotPresent safe and a rollback a matter of naming an old tag.
+    - name: Get short sha
+      run: echo "SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v4
+
+    # The chart's values.yaml is the single source of truth for where the image lives,
+    # so renaming the registry project is one edit rather than four that can drift out
+    # of step with each other.
+    #
+    # Read with sed rather than yq: `yq` is two different programs with the same name
+    # (mikefarah's Go one on GitHub's runners, kislyuk's jq wrapper elsewhere) and their
+    # syntax is not compatible, so a workflow using it breaks depending on where it
+    # runs. PyYAML is not guaranteed on the runner either. sed needs neither, and the
+    # key is unique - which is asserted rather than assumed.
+    - name: Read the image repository from the chart
+      run: |
+        set -euo pipefail
+        VALUES=helm/helm-versions/values.yaml
+
+        matches=$(grep -c '^[[:space:]]*repository:' "$VALUES")
+        if [ "$matches" -ne 1 ]; then
+          echo "::error::expected exactly one 'repository:' key in $VALUES, found $matches"
+          exit 1
+        fi
+
+        REPO=$(sed -nE 's|^[[:space:]]*repository:[[:space:]]*"?([^"#[:space:]]+)"?.*|\1|p' "$VALUES")
+        if [ -z "$REPO" ]; then
+          echo "::error::could not read the image repository from $VALUES"
+          exit 1
+        fi
+
+        echo "IMAGE_REPO=${REPO}" >> $GITHUB_ENV
+        # Host + project, which is the form the CIRRUS registry login expects.
+        echo "REGISTRY=$(echo "${REPO}" | cut -d/ -f1-2)" >> $GITHUB_ENV
+        echo "image repository -> ${REPO}"
+
+    # Default docker-container driver, running on the runner itself. The registry cache
+    # below is what keeps this comparable to the shared in-cluster builder: layers are
+    # reused across runs even though the runner is thrown away after each one.
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # Log in to the cirrus hosted container registry instead of dockerhub
+    - name: registry login
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}            # derived from the chart's values.yaml
+        username: ${{ secrets.hub_user }}        # robot account for your project
+        password: ${{ secrets.hub_password }}    # set up in the github CI settings
+
+    - name: Build
+      uses: docker/build-push-action@v6
+      with:
+        push: true
+        tags: ${{ env.IMAGE_REPO }}:${{ env.SHORT_SHA }}
+        file: Dockerfile
+        cache-from: "type=registry,ref=${{ env.IMAGE_REPO }}:cache"
+        cache-to: "type=registry,ref=${{ env.IMAGE_REPO }}:cache,image-manifest=true,mode=max"
+
+    # Only reached when the build and push succeeded, so the tag named in git always
+    # exists in the registry. Ordering matters: bumping first would leave the chart
+    # pointing at an image that was never pushed.
+    - name: Update Helm values to the new image tag
+      run: |
+        set -euo pipefail
+        VALUES=helm/helm-versions/values.yaml
+
+        # sed, not yq: it isn't installed on every runner and this is one key. The
+        # anchor is only safe because `tag:` appears exactly once in the file, so
+        # assert that rather than trusting it - a future values key called `tag` would
+        # otherwise be silently rewritten with an image SHA.
+        matches=$(grep -c '^[[:space:]]*tag:' "$VALUES")
+        if [ "$matches" -ne 1 ]; then
+          echo "::error::expected exactly one 'tag:' key in $VALUES, found $matches"
+          exit 1
+        fi
+
+        sed -i -E "s|^([[:space:]]*)tag:.*|\\1tag: \"${SHORT_SHA}\"|" "$VALUES"
+
+        # Don't commit whatever sed produced - prove it. Rendering the chart checks the
+        # file still parses *and* that the tag reaches the manifest, which is the thing
+        # that actually has to be true. A bare YAML parse would pass on a file that had
+        # the tag written into the wrong key.
+        if ! helm template ci-check helm/helm-versions \
+              --set oauth.clientId=ci-validation \
+              | grep -q "image: ${IMAGE_REPO}:${SHORT_SHA}$"; then
+          echo "::error::chart does not render ${IMAGE_REPO}:${SHORT_SHA} after the bump"
+          git checkout -- "$VALUES"
+          exit 1
+        fi
+        echo "values.yaml image tag -> ${SHORT_SHA}"
+
+        if git diff --quiet -- "$VALUES"; then
+          echo "values.yaml already on ${SHORT_SHA}, nothing to commit"
+          exit 0
+        fi
+
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add "$VALUES"
+        git commit -m "Deploy image ${SHORT_SHA} [skip ci]"
+
+        # main may have moved while the image was building. Rebase and retry rather
+        # than force-push: this commit is never worth losing someone else's work for.
+        for attempt in 1 2 3; do
+          if git push origin HEAD:${GITHUB_REF_NAME}; then
+            exit 0
+          fi
+          echo "push rejected (attempt ${attempt}), rebasing onto origin/${GITHUB_REF_NAME}"
+          git pull --rebase origin ${GITHUB_REF_NAME}
+        done
+        echo "::error::could not push the image tag bump after 3 attempts"
+        exit 1

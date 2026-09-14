@@ -25,10 +25,15 @@ from githubauth import (  # noqa: E402
 CONFIG = OAuthConfig(client_id='cid', client_secret='shh', org='NCAR', team='cirrus-admins')
 
 
-def response(status=200, payload=None):
-    """A stand-in for a requests.Response carrying JSON"""
+def response(status=200, payload=None, headers=None):
+    """A stand-in for a requests.Response carrying JSON
+
+    `headers` is a real dict rather than a Mock attribute: `Mock().headers.get(x)`
+    returns a truthy Mock, which would make every 403 here look like a SAML response.
+    """
     stub = mock.Mock()
     stub.status_code = status
+    stub.headers = headers or {}
     stub.json.return_value = payload if payload is not None else {}
     stub.raise_for_status.side_effect = (
         None if status < 400 else requests.HTTPError(f"{status}"))
@@ -64,9 +69,22 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict('os.environ', {}, clear=True):
             self.assertIsNone(config_from_env('git@github.com:NCAR/charts.git'))
 
-    def test_none_when_only_client_id_is_set(self):
-        with mock.patch.dict('os.environ', {'GITHUB_CLIENT_ID': 'cid'}, clear=True):
-            self.assertIsNone(config_from_env())
+    def test_half_a_credential_raises_rather_than_reading_as_unconfigured(self):
+        """A misspelled or dropped Secret key must not degrade into an open dashboard"""
+        for present, missing in [('GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET'),
+                                 ('GITHUB_CLIENT_SECRET', 'GITHUB_CLIENT_ID')]:
+            with self.subTest(present=present):
+                with mock.patch.dict('os.environ', {present: 'x'}, clear=True):
+                    with self.assertRaises(githubauth.ConfigError) as caught:
+                        config_from_env()
+                self.assertIn(missing, str(caught.exception))
+
+    def test_an_empty_string_counts_as_missing(self):
+        # An unresolved secretKeyRef arrives as "" rather than absent.
+        env = {'GITHUB_CLIENT_ID': 'cid', 'GITHUB_CLIENT_SECRET': ''}
+        with mock.patch.dict('os.environ', env, clear=True):
+            with self.assertRaises(githubauth.ConfigError):
+                config_from_env()
 
     def test_defaults_to_cirrus_admins(self):
         env = {'GITHUB_CLIENT_ID': 'cid', 'GITHUB_CLIENT_SECRET': 'shh'}
@@ -149,16 +167,72 @@ class TeamMembershipTests(unittest.TestCase):
                 assert_team_member('tok', CONFIG, 'octocat')
         self.assertIn('pending', caught.exception.message)
 
-    def test_404_and_403_both_read_as_not_a_member(self):
-        # A secret team is invisible to non-members (404) and a visible one refuses the
-        # lookup (403). Same denial either way - the distinction isn't the user's.
-        for status in (403, 404):
-            with self.subTest(status=status):
-                with mock.patch('requests.get', return_value=response(status)):
-                    with self.assertRaises(AuthError) as caught:
-                        assert_team_member('tok', CONFIG, 'octocat')
-                self.assertIn('not a member', caught.exception.message)
-                self.assertEqual(caught.exception.status, 403)
+    def test_404_reads_as_not_a_member(self):
+        # A non-member, a team that doesn't exist and a secret team the user can't see
+        # are indistinguishable over the API and all mean the same thing. One denial.
+        with mock.patch('requests.get', return_value=response(404)):
+            with self.assertRaises(AuthError) as caught:
+                assert_team_member('tok', CONFIG, 'octocat')
+        self.assertIn('not a member', caught.exception.message)
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_403_does_not_tell_a_real_member_they_are_not_a_member(self):
+        """403 is GitHub refusing the question, not answering it
+
+        The case that motivated splitting this from 404: an org with OAuth App access
+        restrictions that hasn't approved this app. Every genuine team member is turned
+        away, and the old message sent them to look at their team membership - the one
+        place the problem isn't.
+        """
+        body = {'message': "Although you appear to have the correct authorization "
+                           "credentials, the `NCAR` organization has enabled OAuth App "
+                           "access restrictions."}
+        with mock.patch('requests.get', return_value=response(403, body)):
+            with self.assertRaises(AuthError) as caught:
+                assert_team_member('tok', CONFIG, 'octocat')
+
+        message = caught.exception.message
+        self.assertNotIn('not a member', message)
+        self.assertIn('organization setting', message)
+        self.assertIn('OAuth App', message)           # GitHub's own wording, passed through
+        self.assertEqual(caught.exception.status, 502)
+
+    def test_403_is_reported_even_when_github_sends_no_message(self):
+        with mock.patch('requests.get', return_value=response(403)):
+            with self.assertRaises(AuthError) as caught:
+                assert_team_member('tok', CONFIG, 'octocat')
+        self.assertNotIn('not a member', caught.exception.message)
+        self.assertNotIn('GitHub says', caught.exception.message)
+
+    def test_saml_sso_is_called_out_separately_because_the_user_can_fix_it(self):
+        headers = {'X-GitHub-SSO': 'required; url=https://github.com/orgs/NCAR/sso'}
+        with mock.patch('requests.get',
+                        return_value=response(403, {'message': 'Resource protected by '
+                                                               'organization SAML enforcement.'},
+                                              headers=headers)):
+            with self.assertRaises(AuthError) as caught:
+                assert_team_member('tok', CONFIG, 'octocat')
+
+        message = caught.exception.message
+        self.assertIn('single sign-on', message)
+        self.assertNotIn('not a member', message)
+
+    def test_a_non_json_error_body_does_not_break_the_denial(self):
+        stub = response(403)
+        stub.json.side_effect = ValueError('not json')
+        with mock.patch('requests.get', return_value=stub):
+            with self.assertRaises(AuthError) as caught:
+                assert_team_member('tok', CONFIG, 'octocat')
+        self.assertIn('organization setting', caught.exception.message)
+
+    def test_githubs_message_is_collapsed_and_truncated(self):
+        body = {'message': 'line one\n\n   line two   ' + 'x' * 500}
+        with mock.patch('requests.get', return_value=response(403, body)):
+            with self.assertRaises(AuthError) as caught:
+                assert_team_member('tok', CONFIG, 'octocat')
+        quoted = caught.exception.message.split('GitHub says: ', 1)[1]
+        self.assertNotIn('\n', quoted)
+        self.assertLessEqual(len(quoted), 300)
 
     def test_server_error_is_reported_as_upstream_not_as_denial(self):
         with mock.patch('requests.get', return_value=response(500)):

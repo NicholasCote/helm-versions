@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.webapp.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.webapp.name }}
+    group: {{ .Values.webapp.group }}
+spec:
+  # Pinned to one pod, and deliberately not a value. Sign-in sessions live in the
+  # process, so a second replica would sign people out at random as requests landed on
+  # the pod that didn't have their session. Scaling out means giving TokenStore a
+  # shared backend first - see the chart README.
+  replicas: 1
+  # ...and for the same reason, replace rather than overlap: two pods running at once
+  # during a rollout have the same problem as two replicas.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Values.webapp.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.webapp.name }}
+        group: {{ .Values.webapp.group }}
+      annotations:
+        # Roll the pod when the configuration changes, so an edited value takes effect
+        # on `helm upgrade` instead of waiting for the next unrelated restart.
+        checksum/config: {{ toYaml .Values.oauth | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000                   # `appuser` in the image
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: {{ .Values.webapp.name }}
+        image: {{ .Values.webapp.container.image.repository }}:{{ required "webapp.container.image.tag is required - CI sets it per build; see the chart README" .Values.webapp.container.image.tag }}
+        # Safe with an immutable per-build tag, and the reason `latest` is refused.
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            memory: {{ .Values.webapp.container.requests.memory }}
+            cpu: {{ .Values.webapp.container.requests.cpu }}
+          limits:
+            memory: {{ .Values.webapp.container.limits.memory }}
+            cpu: {{ .Values.webapp.container.limits.cpu }}
+        ports:
+        - containerPort: {{ .Values.webapp.container.port }}
+        env:
+        - name: GIT_REPO_URL
+          value: {{ .Values.tracker.gitRepoUrl | quote }}
+        {{- if .Values.tracker.clusters }}
+        - name: CLUSTERS
+          value: {{ .Values.tracker.clusters | quote }}
+        {{- end }}
+        - name: SESSION_TTL_HOURS
+          value: {{ .Values.tracker.sessionTtlHours | quote }}
+        - name: GITHUB_ALLOWED_TEAM
+          value: {{ .Values.oauth.allowedTeam | quote }}
+        - name: GITHUB_CLIENT_ID
+          value: {{ required "oauth.clientId is required - see the chart README" .Values.oauth.clientId | quote }}
+        # Derived from the FQDN so it cannot drift from the URL the browser is actually
+        # sent back to. GitHub rejects the login outright if it doesn't match the OAuth
+        # App's registered callback, so guessing it wrong fails loudly rather than
+        # quietly. The app refuses to start if this is unset.
+        - name: OAUTH_REDIRECT_URI
+          value: {{ .Values.oauth.redirectUri | default (printf "https://%s/auth/callback" .Values.webapp.tls.fqdn) | quote }}
+        - name: GITHUB_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.webapp.name }}-esos
+              key: {{ .Values.oauth.secret.clientSecretKey }}
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.webapp.name }}-esos
+              key: {{ .Values.oauth.secret.sessionKeyKey }}
+        # Readiness, not liveness: /health reports 503 when the app has no working
+        # auth configuration, which halts a rollout onto pods that would refuse every
+        # request. Restarting wouldn't fix a missing Secret, so liveness stays a plain
+        # TCP check and the pod is left up for its logs to be read.
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.webapp.container.port }}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: {{ .Values.webapp.container.port }}
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      # The clone target, helm's cache (HELM_*_HOME point under /tmp/helm) and the
+      # askpass helper all land here. emptyDir, not a PVC: every one of them is
+      # rebuilt on each refresh and none should outlive the pod.
+      - name: tmp
+        emptyDir:
+          sizeLimit: {{ .Values.webapp.tmp.sizeLimit }}

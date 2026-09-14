@@ -1,0 +1,60 @@
+# The dashboard holds sign-in sessions in process memory, so this is pinned to a single
+# pod in the Deployment template and is deliberately not a value. See the README.
+
+webapp:
+  name: helm-versions                     # Name for k8s objects
+  group: helm-versions                    # Group label for related resources
+  path: /                                 # URL path suffix
+  tls:
+    fqdn: helm-versions.k8s.ucar.edu      # Must be unique and end in .k8s.ucar.edu
+    secretName: incommon-cert-helm-versions   # Unique TLS secret name for your FQDN
+  ingress:
+    visibility: internal                  # internal or external
+  container:
+    image:
+      # Split into repository and tag rather than one string, because CI rewrites the
+      # tag on every build and `tag:` is the only key in this file it has to find.
+      repository: hub.k8s.ucar.edu/cirrus/helm-versions
+      # Required - there is no sensible default, so rendering fails rather than
+      # guessing. Set by .github/workflows/build-push-image.yaml on each push to main;
+      # `helm template` before the first build needs --set.
+      #
+      # Never `latest`: imagePullPolicy is IfNotPresent, so a re-pushed `latest` would
+      # never be pulled and the deployment would sit on a stale image while reporting
+      # success. An immutable tag per build is what makes a rollout mean anything.
+      tag: ""
+    port: 5000                            # Port the container listens on
+    requests:
+      memory: 512M                        # Guaranteed memory allocation
+      cpu: 500m                           # Guaranteed CPU allocation
+    limits:
+      memory: 2G                          # Maximum memory allowed. Two `helm template`
+      cpu: 2                              # renders run concurrently; see HELM_MAX_CONCURRENT_RENDERS
+  # Scratch space for the git clone, the helm chart cache and the askpass helper. The
+  # root filesystem is read-only, so all three need this; nothing here outlives the pod.
+  tmp:
+    sizeLimit: 2Gi
+
+# What the dashboard reads and who may read it.
+tracker:
+  gitRepoUrl: git@github.com:NCAR/cisl-cloud-charts.git   # Repo to clone and analyze
+  clusters: ""                            # Comma-separated subset, e.g. "mlc1,nwc3". Empty = all.
+  sessionTtlHours: 8                      # How long a sign-in lasts before re-authenticating
+
+oauth:
+  # Not a secret: the client id appears in every authorization URL the browser follows.
+  # Kept here rather than in OpenBao so the deployed configuration is reviewable in git.
+  clientId: ""                            # OAuth App client id - REQUIRED
+  allowedTeam: NCAR/cirrus-admins         # Only active members of this team may sign in
+  # The callback URL is derived from tls.fqdn as https://<fqdn>/auth/callback and must
+  # match the OAuth App's registered callback exactly. Set this only to override that.
+  redirectUri: ""
+
+  # The two values that are secret, pulled from bao.k8s.ucar.edu.
+  #   client-secret: the OAuth App's client secret
+  #   secret-key:    signs the session cookie; any 32+ byte random string
+  #                  (`openssl rand -hex 32`). Changing it signs everyone out.
+  secret:
+    secretPath: cirrus/helm-versions      # Path in OpenBao where the secrets are stored
+    clientSecretKey: client-secret        # Key holding the OAuth App client secret
+    sessionKeyKey: secret-key             # Key holding the cookie signing key

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: helm-versions                       # Name of this Helm chart
+description: Helm chart dashboard for CIRRUS, with GitHub OAuth and OpenBao secrets
+type: application                         # Application chart (not a library)
+version: 0.1.0                            # Chart version, increment when you change templates
+appVersion: "1.0.0"                       # Application version, increment when you update your image

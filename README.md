@@ -117,19 +117,48 @@ The dashboard signs users in with GitHub and limits access to one GitHub team. T
 sign-in does double duty: the OAuth token it produces is also what clones `GIT_REPO_URL`,
 so there is no deploy key or SSH secret in the cluster at all.
 
-Set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` to turn it on. **With them unset the
-app serves the dashboard with no authentication whatsoever** — that is the local
-development mode, and it prints a warning at startup. Don't expose that beyond localhost;
-`/api/diff` runs `helm` on request.
+Set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` and `OAUTH_REDIRECT_URI` to turn it on.
+
+The app **fails closed**. Three configurations, and only three:
+
+| Configuration | Result |
+| --- | --- |
+| Both OAuth variables + `OAUTH_REDIRECT_URI` | Authenticated. |
+| Neither OAuth variable, `ALLOW_UNAUTHENTICATED=1` | Open dashboard, with a startup warning. |
+| Anything else | Refuses to serve. |
+
+"Anything else" covers the case worth designing for: *one* of the two OAuth variables
+set. A renamed Secret, a misspelled key, a `secretKeyRef` dropped in a manifest refactor
+— any of those would otherwise read as "OAuth not configured" and quietly serve an open
+dashboard. Half a credential is never deliberate, so it's a startup error. A missing
+`OAUTH_REDIRECT_URI` is the same: the alternative is deriving it from the request.
+
+Running openly has to be asked for by name, with `ALLOW_UNAUTHENTICATED=1`. Without
+either that or working OAuth, every route returns `503` — including `/health`, which
+answers with `status: not_configured` so the reason is readable, but reports unhealthy so
+the pod never goes Ready. A misconfigured rollout stops with the previous pods still
+serving, rather than completing onto pods that refuse every request. Don't expose the
+open mode; `/api/diff` runs `helm` on request.
 
 ### How access is decided
 
 1. The user is sent to GitHub and grants the `repo` and `read:org` scopes.
 2. The callback exchanges the code for an access token and reads the user's profile.
 3. `GET /orgs/<org>/teams/<team>/memberships/<user>` must come back `active`. A `pending`
-   invitation is refused with a message saying to accept it; a non-member, a team that
-   doesn't exist, and a secret team the user can't see are indistinguishable over the API
-   and all collapse into one "you're not a member" denial.
+   invitation is refused with a message saying to accept it. A `404` is a denial: a
+   non-member, a team that doesn't exist and a secret team the user can't see are
+   indistinguishable over the API and all collapse into one "you're not a member" rather
+   than leaking which case it was.
+
+   A `403` is reported differently, because it means GitHub *refused the question* rather
+   than answering it, and is usually nothing to do with membership — most often an
+   organization that restricts OAuth Apps and hasn't approved this one, or a SAML org the
+   token isn't authorized for. Both turn away every genuine team member, so reporting
+   them as "you're not a member" would be false and would send people to look at the one
+   thing that isn't broken. GitHub's own explanation is passed through. Nothing about the
+   request is user-controlled — org and team come from this deployment's configuration,
+   the username from GitHub's own `/user` — so that reply can't be steered by whoever is
+   signing in.
 4. The token is stored **server-side** and the browser gets an opaque session id.
 
 Step 4 matters: Flask's session cookie is *signed, not encrypted*, so anything put in it
@@ -193,7 +222,8 @@ credential at startup to clone with.
 | `GITHUB_CLIENT_ID` | for OAuth | — | OAuth App client id. Setting this **and** the secret enables authentication. |
 | `GITHUB_CLIENT_SECRET` | for OAuth | — | OAuth App client secret. |
 | `GITHUB_ALLOWED_TEAM` | no | `NCAR/cirrus-admins` | Team whose members may sign in, as `org/team`. A bare `team` takes the org from `GIT_REPO_URL`. |
-| `OAUTH_REDIRECT_URI` | recommended | derived from request | Must equal the OAuth App's callback URL. Set it explicitly in Kubernetes. |
+| `OAUTH_REDIRECT_URI` | **yes, with OAuth** | — | Must equal the OAuth App's callback URL exactly. Startup fails without it. |
+| `ALLOW_UNAUTHENTICATED` | for the open mode | — | Set to `1` to serve with no authentication at all. Required when the OAuth variables are unset, or the app refuses to serve. |
 | `SECRET_KEY` | recommended | random per start | Signs the session cookie. Unset means every restart signs everyone out. |
 | `SESSION_TTL_HOURS` | no | `8` | How long a sign-in lasts before it has to be repeated. |
 | `SESSION_COOKIE_SECURE` | no | `true` | Set to `false` only to run over plain http locally; the cookie is otherwise never sent. |
@@ -253,14 +283,19 @@ docker build -t helm-versions .
 docker run -p 5000:5000 \
   -e GIT_REPO_URL="git@github.com:NCAR/cisl-cloud-charts.git" \
   -e SSH_KEY_CONTENT_BASE64="$(base64 -w0 ~/.ssh/id_ed25519)" \
+  -e ALLOW_UNAUTHENTICATED=1 \
   helm-versions
 ```
+
+`ALLOW_UNAUTHENTICATED=1` is what makes this an open dashboard rather than a refusal —
+see [Authentication](#authentication). Fine on a laptop, not on anything reachable.
 
 ### With a mounted key file
 
 ```bash
 docker run -p 5000:5000 \
   -e SSH_KEY_PATH=/app/.ssh/id_rsa \
+  -e ALLOW_UNAUTHENTICATED=1 \
   -v ~/.ssh/id_ed25519:/app/.ssh/id_rsa:ro \
   helm-versions
 ```
@@ -274,14 +309,14 @@ Pass `CLUSTERS` to scope the dashboard to a subset:
 ```bash
 docker run -p 5000:5000 \
   -e SSH_KEY_CONTENT_BASE64="$(base64 -w0 ~/.ssh/id_ed25519)" \
-  -e CLUSTERS=mlc1 \
+  -e CLUSTERS=mlc1 -e ALLOW_UNAUTHENTICATED=1 \
   helm-versions
 ```
 
 ```bash
 docker run -p 5000:5000 \
   -e SSH_KEY_CONTENT_BASE64="$(base64 -w0 ~/.ssh/id_ed25519)" \
-  -e CLUSTERS=mlc1,nwc3 \
+  -e CLUSTERS=mlc1,nwc3 -e ALLOW_UNAUTHENTICATED=1 \
   helm-versions
 ```
 
@@ -313,64 +348,44 @@ docker run --rm -e GITHUB_TOKEN helm-versions python tracker.py --cluster mlc1
 
 ### Kubernetes
 
-With OAuth there is no git credential in the cluster — only the OAuth App's own client
-secret and a cookie signing key:
+Deploy with the Helm chart in [`helm/helm-versions`](helm/helm-versions/), templated from
+[cirrus-examples](https://github.com/NCAR/cirrus-examples). It wires up the Ingress, the
+InCommon certificate, and the OAuth secrets from OpenBao:
 
 ```bash
-kubectl create secret generic helm-versions-oauth \
-  --from-literal=client-id=Iv1.xxxxxxxxxxxx \
-  --from-literal=client-secret=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
-  --from-literal=secret-key="$(openssl rand -hex 32)"
+helm upgrade --install helm-versions ./helm/helm-versions \
+  --namespace cirrus \
+  --set oauth.clientId=Iv1.xxxxxxxxxxxx
 ```
 
-```yaml
-spec:
-  # Sessions are held in process memory, so a second replica would sign users out at
-  # random as requests landed on the pod that didn't have their session.
-  replicas: 1
-  template:
-    spec:
-      containers:
-        - name: helm-versions
-          env:
-            - name: GIT_REPO_URL
-              value: git@github.com:NCAR/cisl-cloud-charts.git
-            - name: CLUSTERS
-              value: mlc1,nwc3
-            - name: GITHUB_ALLOWED_TEAM
-              value: NCAR/cirrus-admins
-            - name: OAUTH_REDIRECT_URI
-              value: https://helm-versions.example.org/auth/callback
-            - name: GITHUB_CLIENT_ID
-              valueFrom:
-                secretKeyRef: { name: helm-versions-oauth, key: client-id }
-            - name: GITHUB_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef: { name: helm-versions-oauth, key: client-secret }
-            - name: SECRET_KEY
-              valueFrom:
-                secretKeyRef: { name: helm-versions-oauth, key: secret-key }
-          readinessProbe:
-            httpGet: { path: /health, port: 5000 }
-          volumeMounts:
-            - { name: helm-tmp, mountPath: /tmp/helm }
-      volumes:
-        - name: helm-tmp
-          emptyDir: {}
-```
+The image tag comes from CI: [`.github/workflows/build-push-image.yaml`](.github/workflows/build-push-image.yaml)
+builds on each push to `main`, tags with the short commit SHA, and — only after a
+successful push — writes that tag into the chart's `values.yaml` and commits it back. The
+chart in git therefore always names an image that exists in the registry. The tag is never
+`latest`: `imagePullPolicy` is `IfNotPresent`, so a re-pushed `latest` would never be
+pulled and the deployment would sit on a stale image while reporting success.
 
-`/health` is deliberately reachable without a session so probes don't need a credential;
-it reports no chart data. Everything else is default-deny.
+The chart's [README](helm/helm-versions/README.md) covers the OAuth App registration, the
+OpenBao layout, and why it pins a single replica. Three things it does that are worth
+knowing about here:
+
+- `OAUTH_REDIRECT_URI` is derived from `webapp.tls.fqdn`, so the callback URL cannot drift
+  from the URL the browser is actually returned to.
+- `replicas` is fixed at 1 and isn't a value. Sessions are in-memory, so a second pod signs
+  people out at random. `strategy: Recreate` applies the same constraint to rollouts.
+- The container runs read-only as uid 1000 with all capabilities dropped, with one
+  `emptyDir` at `/tmp` for the clone, helm's cache and the askpass helper.
 
 #### With an SSH key instead (no OAuth)
 
-Kubernetes already base64-encodes Secret values in `data:`. Store the *already
-base64-encoded key* as the secret value so the app receives base64 after Kubernetes decodes
-its own layer — i.e. double-encode when creating with `data:`, or use `stringData:` with the
-single-encoded key.
+This also needs `ALLOW_UNAUTHENTICATED=1`, without which the app refuses to serve. It is
+a **no authentication** deployment; put something in front of it. The chart doesn't
+template this mode — set the variables directly:
 
 ```yaml
 env:
+  - name: ALLOW_UNAUTHENTICATED
+    value: "1"
   - name: SSH_KEY_CONTENT_BASE64
     valueFrom:
       secretKeyRef:
@@ -378,8 +393,10 @@ env:
         key: ssh-privatekey-base64
 ```
 
-Leaving `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` unset serves the dashboard with **no
-authentication**. Put something in front of it if you do this.
+Kubernetes already base64-encodes Secret values in `data:`. Store the *already
+base64-encoded key* as the secret value so the app receives base64 after Kubernetes decodes
+its own layer — i.e. double-encode when creating with `data:`, or use `stringData:` with the
+single-encoded key.
 
 ## Dashboard
 
@@ -411,7 +428,7 @@ actually analyzed — use those to make the run faster, and the dropdown to focu
 | `/login` | GET | Starts the GitHub OAuth flow. Public. |
 | `/auth/callback` | GET | OAuth callback: verifies state, exchanges the code, checks team membership. Public. |
 | `/logout` | GET, POST | Drops the server-side token and clears the cookie. Public. |
-| `/health` | GET | Liveness/readiness check. **Public** so probes need no credential; reports no chart data. |
+| `/health` | GET | Readiness check. **Public** so probes need no credential; reports no chart data. Returns `503 not_configured` when the app has no working auth configuration, so a bad rollout stops instead of completing onto pods that refuse everything. |
 | `/debug` | GET | Reports which config vars are set — booleans only, never values. |
 
 Every path not marked Public requires a session when OAuth is configured. The gate is
@@ -502,6 +519,12 @@ one and the image is rebuilt.
 - **Clone fails** — hit `/debug` to confirm which credential the app sees. On the SSH path
   the container logs include an `ssh -T git@github.com` auth test before the clone; on the
   OAuth path the log names the user whose token was used.
+- **Every route returns 503 `NOT_CONFIGURED`** — the app has neither working OAuth nor
+  `ALLOW_UNAUTHENTICATED=1`. Usually the OAuth Secret didn't resolve. The pod will be
+  running but not Ready; `/health` answers with the reason.
+- **Pod won't start, `ConfigError` in the logs** — either one OAuth variable is set
+  without the other (usually a renamed Secret key), or `OAUTH_REDIRECT_URI` is missing.
+  Both are deliberate refusals; the message names which.
 - **"redirect_uri_mismatch" from GitHub** — `OAUTH_REDIRECT_URI` doesn't exactly match the
   OAuth App's registered callback URL. It has to match including scheme and trailing path.
 - **"That sign-in link has expired or didn't start here"** — the CSRF state didn't match.
@@ -512,6 +535,12 @@ one and the image is rebuilt.
   `GITHUB_ALLOWED_TEAM`; a pending invitation is refused with its own message. If you are
   certain the membership is active, confirm the org and team slug (the URL form, not the
   display name), and that the `read:org` scope was granted.
+- **"GitHub wouldn't answer whether you're in ..."** — an org policy, not your account.
+  Almost always OAuth App access restrictions: an organization owner has to approve the
+  app once, under **Settings → Third-party Access**. Until then nobody can sign in.
+  GitHub's own explanation is included in the message.
+- **"Your GitHub token isn't authorized for the ... organization"** — the org enforces
+  SAML single sign-on. Authorize the app for the org on GitHub, then sign in again.
 - **Everyone gets signed out at random** — more than one replica. Sessions live in process
   memory; run `replicas: 1`.
 - **Signed out after every deploy** — `SECRET_KEY` is unset, so a new one is generated each

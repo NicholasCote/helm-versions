@@ -50,6 +50,10 @@ REPO_SLUG_PATTERN = re.compile(
     r'(?:github\.com[:/])(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?/?$')
 
 
+class ConfigError(Exception):
+    """A configuration that must stop the process rather than degrade quietly"""
+
+
 class AuthError(Exception):
     """A login that cannot proceed, with a message safe to show the user"""
 
@@ -91,16 +95,26 @@ def https_clone_url(git_repo_url: str) -> Optional[str]:
 
 
 def config_from_env(git_repo_url: str = None) -> Optional[OAuthConfig]:
-    """OAuth settings from the environment, or None if OAuth isn't configured.
+    """OAuth settings from the environment, or None if OAuth isn't configured at all.
 
-    Returning None rather than raising is what lets the CLI and local SSH runs keep
-    working untouched: no client id means no web auth, and app.py refuses to serve
-    rather than falling back to an open dashboard.
+    Neither variable set means "no web auth", which is the local/CLI case; app.py then
+    refuses to serve unless the operator has explicitly opted into an open dashboard.
+
+    Exactly one set is a different thing entirely: somebody meant to configure OAuth and
+    it didn't take - a renamed Secret, a misspelled key, a dropped secretKeyRef. Treating
+    that as "not configured" turns a typo into a silently unauthenticated deployment, so
+    it raises instead. Half a credential is never a deliberate state.
     """
     client_id = (os.getenv('GITHUB_CLIENT_ID') or '').strip()
     client_secret = (os.getenv('GITHUB_CLIENT_SECRET') or '').strip()
 
-    if not client_id or not client_secret:
+    if bool(client_id) != bool(client_secret):
+        missing = 'GITHUB_CLIENT_SECRET' if client_id else 'GITHUB_CLIENT_ID'
+        raise ConfigError(
+            f"{missing} is not set, but the other half of the OAuth App credentials is. "
+            f"Refusing to start: continuing would serve the dashboard unauthenticated.")
+
+    if not client_id:
         return None
 
     # Default the org to whoever owns the repo being analyzed - a dashboard for
@@ -189,16 +203,34 @@ def fetch_user(token: str) -> dict:
     return payload
 
 
+def github_message(response) -> str:
+    """The `message` GitHub puts on an error response, collapsed to one line
+
+    Safe to show a user: no part of the membership request is user-controlled - the org
+    and team come from this deployment's own configuration and the username from
+    GitHub's own /user response - so GitHub's reply cannot be steered by whoever is
+    signing in. Truncated anyway, because these run long and end in a docs URL.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return ''
+    message = ((payload or {}).get('message') or '').strip()
+    return ' '.join(message.split())[:300]
+
+
 def assert_team_member(token: str, config: OAuthConfig, login: str) -> None:
     """Raise AuthError unless `login` is an active member of the allowed team.
 
-    A non-member gets a 404 rather than a 403, and so does a team that doesn't exist or
-    that the user can't see (secret teams are invisible to outsiders). Those are
-    indistinguishable over the API and all mean the same thing here - not a member - so
-    they collapse into one denial rather than leaking which case it was.
-
     `pending` is an invitation that hasn't been accepted. It is not membership yet, and
     is called out separately because "accept the invite" is a fix the user can act on.
+
+    404 and 403 mean genuinely different things here and are reported differently. 404
+    is GitHub answering the question: not a member - or a team that doesn't exist, or a
+    secret team the user can't see, which are indistinguishable over the API and all
+    amount to the same thing, so they collapse into one denial rather than leaking which
+    case it was. 403 is GitHub *refusing the question*, which is a different situation
+    with a different fix and is usually nothing to do with membership at all.
     """
     response = api_get(
         token, f"/orgs/{config.org}/teams/{config.team}/memberships/{login}")
@@ -213,8 +245,32 @@ def assert_team_member(token: str, config: OAuthConfig, login: str) -> None:
                 f"accept it on GitHub, then sign in again.")
         raise AuthError(f"Your membership in {config.team_slug} is '{state}', not active.")
 
-    if response.status_code in (403, 404):
+    if response.status_code == 404:
         raise AuthError(f"You're not a member of the {config.team_slug} team.")
+
+    if response.status_code == 403:
+        # Almost always an org-level policy that this OAuth App hasn't satisfied, not a
+        # statement about the person signing in. Reporting it as "you're not a member"
+        # tells an actual member something false and sends them to look in the one place
+        # the problem isn't - so say what happened and pass GitHub's own wording along.
+        detail = github_message(response)
+
+        # SAML orgs mark the response with this header and the remedy is the user's own:
+        # authorize the token for the org on github.com and sign in again.
+        if response.headers.get('X-GitHub-SSO'):
+            raise AuthError(
+                f"Your GitHub token isn't authorized for the {config.org} organization. "
+                f"{config.org} uses SAML single sign-on, so you need to authorize this "
+                f"app for it on GitHub, then sign in again."
+                + (f" GitHub says: {detail}" if detail else ""))
+
+        raise AuthError(
+            f"GitHub wouldn't answer whether you're in {config.team_slug}. This is an "
+            f"organization setting rather than anything about your account - most often "
+            f"{config.org} restricts OAuth Apps and hasn't approved this one yet, which "
+            f"an organization owner has to do once."
+            + (f" GitHub says: {detail}" if detail else ""),
+            status=502)
 
     if response.status_code == 401:
         raise AuthError("GitHub rejected the access token.", status=401)

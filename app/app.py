@@ -27,10 +27,19 @@ GIT_REPO_URL = os.getenv('GIT_REPO_URL', 'git@github.com:NCAR/cisl-cloud-charts.
 # It is emphatically not a deployment mode - see require_auth.
 OAUTH = githubauth.config_from_env(GIT_REPO_URL)
 
-# The callback URL registered on the OAuth App. Read here rather than per request
-# because deriving it from the request means trusting Host/X-Forwarded-*, which an
-# attacker can set to point the authorization code at a host they control - and GitHub
-# honors any redirect_uri whose host matches the registered callback's.
+# Serving with no authentication has to be asked for by name. Without OAuth configured
+# the dashboard is fully open - /debug dumps configuration and /api/diff shells out to
+# helm - and the failure mode that matters is nobody deciding to do that: a Secret gets
+# renamed, the pod starts healthy because /health is public, the readiness probe passes,
+# and the rollout succeeds onto an open Ingress. One line of stdout is not a control, so
+# the app refuses to serve instead.
+ALLOW_UNAUTHENTICATED = (os.getenv('ALLOW_UNAUTHENTICATED') or '').lower() in ('1', 'true', 'yes')
+
+# The callback URL registered on the OAuth App. Required, not derived: building it from
+# the request means trusting the Host / X-Forwarded-* headers, and GitHub accepts any
+# redirect_uri whose host matches the registered callback's *excluding sub-domains*. A
+# dangling sub-domain pointed at this same Ingress would therefore be handed real
+# authorization codes - which land in a session bound to a `repo`-scoped token.
 OAUTH_REDIRECT_URI = (os.getenv('OAUTH_REDIRECT_URI') or '').strip()
 
 # Which secrets are present, snapshotted at startup for /debug. Booleans only - the
@@ -55,6 +64,12 @@ app.secret_key = os.getenv('SECRET_KEY') or secrets.token_hex(32)
 if not os.getenv('SECRET_KEY') and OAUTH:
     print("⚠ SECRET_KEY not set - generated a random one. "
           "Sessions will not survive a restart; set it from a Secret.")
+
+if OAUTH and not OAUTH_REDIRECT_URI:
+    raise githubauth.ConfigError(
+        "OAUTH_REDIRECT_URI must be set when GitHub OAuth is configured. It has to "
+        "match the OAuth App's registered callback URL exactly, e.g. "
+        "https://helm-versions.example.org/auth/callback")
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -199,14 +214,22 @@ def require_auth():
     endpoint in particular shells out to helm, and was only ever safe because nothing
     could reach it.
     """
-    if not OAUTH:
-        # No OAuth configured: local development against an ssh key, unchanged. Refuse
-        # to do this while listening on anything but loopback, because the failure mode
-        # is an open dashboard that runs helm on request.
-        return None
-
+    # Public first, so that a server which is refusing to serve still answers its
+    # probe. A pod that looks healthy and empty is the regression being guarded
+    # against here; one that fails its readiness check is the intended outcome.
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
+
+    if not OAUTH:
+        if ALLOW_UNAUTHENTICATED:
+            return None  # deliberately open: local development against an ssh key
+        # Configured for neither authentication nor an explicitly open dashboard.
+        # Serve nothing rather than guess which was meant.
+        return jsonify({"error": {
+            "code": "NOT_CONFIGURED",
+            "message": "This server has no authentication configured. Set "
+                       "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET, or set "
+                       "ALLOW_UNAUTHENTICATED=1 to serve the dashboard openly."}}), 503
 
     if current_session():
         return None
@@ -238,12 +261,13 @@ def login():
 
 
 def oauth_redirect_uri():
-    """The callback URL to send GitHub, falling back to one derived from the request
+    """The callback URL to send GitHub
 
-    Set OAUTH_REDIRECT_URI in Kubernetes; the derived form is for `docker run` and
-    local development, where the host header is nobody else's to set.
+    Always the configured value, never one derived from the request - see the comment
+    on OAUTH_REDIRECT_URI. Startup fails when OAuth is on and this is unset, so by the
+    time a request reaches here it is non-empty.
     """
-    return OAUTH_REDIRECT_URI or url_for('callback', _external=True)
+    return OAUTH_REDIRECT_URI
 
 
 @app.route('/auth/callback')
@@ -256,9 +280,14 @@ def callback():
     target = session.pop('next', '/')
 
     if request.args.get('error'):
+        # Logged rather than rendered. This runs before state is validated, so anyone
+        # can reach it with a crafted link, and error_description is whatever the query
+        # string says - attacker-chosen prose on the genuine sign-in page. Autoescaping
+        # stops it being markup; it doesn't stop it reading as our own instructions.
+        print(f"✗ OAuth callback returned error={request.args.get('error')!r} "
+              f"description={request.args.get('error_description')!r}")
         return render_login_error(
-            f"GitHub returned an error: {request.args.get('error_description') or request.args['error']}",
-            status=401)
+            "GitHub didn't complete the sign-in. Try again.", status=401)
 
     # Compared with compare_digest rather than != so a mismatch can't be narrowed by
     # timing, and rejected outright when either side is missing - a callback with no
@@ -523,14 +552,31 @@ def api_diff():
 
 @app.route('/health')
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "healthy",
+    """Health check endpoint
+
+    Reachable without a session, so a probe needs no credential, and it carries no
+    chart data.
+
+    Returns 503 when the app is configured for neither authentication nor an
+    explicitly open dashboard. In that state every other route refuses too, and a
+    server refusing every route is not ready - reporting healthy would let a rollout
+    complete onto pods that serve nothing, which is the failure this is here to make
+    visible. Use it for readiness; a restart won't fix a missing Secret, so liveness
+    should be a plain TCP check.
+    """
+    configured = bool(OAUTH) or ALLOW_UNAUTHENTICATED
+    payload = {
+        "status": "healthy" if configured else "not_configured",
+        "authenticated": bool(OAUTH),
         "last_update": last_update.isoformat() if last_update else None,
         # The dashboard hides its View Diff buttons when helm is unavailable
         "helm_available": differ.helm_version() is not None,
         "helm_version": differ.helm_version(),
-    })
+    }
+    if not configured:
+        payload["message"] = ("Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET, or set "
+                              "ALLOW_UNAUTHENTICATED=1 to serve the dashboard openly.")
+    return jsonify(payload), (200 if configured else 503)
 
 @app.route('/debug')
 def debug():
@@ -575,11 +621,15 @@ if __name__ == '__main__':
     if OAUTH:
         print(f"GitHub OAuth enabled - access limited to the {OAUTH.team_slug} team.")
         print("Waiting for a signed-in user to trigger the first analysis.")
-    else:
-        print("⚠ GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET not set - the dashboard is "
-              "UNAUTHENTICATED. Do not expose this beyond localhost.")
+    elif ALLOW_UNAUTHENTICATED:
+        print("⚠ ALLOW_UNAUTHENTICATED is set - the dashboard is serving with NO "
+              "authentication. /api/diff runs helm on request; don't expose this.")
         print("Starting initial chart analysis in background...")
         threading.Thread(target=update_chart_data, daemon=True).start()
+    else:
+        print("✗ No authentication configured. Set GITHUB_CLIENT_ID and "
+              "GITHUB_CLIENT_SECRET, or set ALLOW_UNAUTHENTICATED=1 to serve openly.")
+        print("  Serving 503 on every route except /health until one of those is set.")
     
     # Start Flask app immediately
     port = int(os.getenv('PORT', 5000))

@@ -71,6 +71,13 @@ class GateTests(unittest.TestCase):
         response = self.client.get('/health')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()['status'], 'healthy')
+        self.assertTrue(response.get_json()['authenticated'])
+
+    def test_health_carries_no_chart_data(self):
+        # It is the one unauthenticated route; it must not become a data leak.
+        body = self.client.get('/health').get_json()
+        self.assertNotIn('chart_data', body)
+        self.assertNotIn('last_update_by', body)
 
     def test_login_page_is_public(self):
         self.assertEqual(self.client.get('/login').status_code, 302)
@@ -229,10 +236,11 @@ class SignedInTests(unittest.TestCase):
 
 
 class OAuthDisabledTests(unittest.TestCase):
-    """Without client credentials the app behaves exactly as it did before."""
+    """With the open mode explicitly opted into, the app behaves as it did before."""
 
     def setUp(self):
-        self.app = load_app({'GIT_REPO_URL': 'git@github.com:NCAR/cisl-cloud-charts.git'})
+        self.app = load_app({'GIT_REPO_URL': 'git@github.com:NCAR/cisl-cloud-charts.git',
+                             'ALLOW_UNAUTHENTICATED': '1'})
         self.client = self.app.app.test_client()
 
     def test_dashboard_is_open(self):
@@ -240,6 +248,11 @@ class OAuthDisabledTests(unittest.TestCase):
 
     def test_api_is_open(self):
         self.assertEqual(self.client.get('/api/charts').status_code, 200)
+
+    def test_health_is_healthy_when_openly_serving_on_purpose(self):
+        response = self.client.get('/health')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()['authenticated'])
 
     def test_api_me_reports_oauth_off(self):
         payload = self.client.get('/api/me').get_json()
@@ -253,6 +266,65 @@ class OAuthDisabledTests(unittest.TestCase):
         with mock.patch.object(self.app.threading, 'Thread') as thread:
             self.client.post('/api/refresh')
         self.assertIsNone(thread.call_args.kwargs['kwargs']['github_token'])
+
+
+class FailClosedTests(unittest.TestCase):
+    """Neither authenticated nor deliberately open means: serve nothing."""
+
+    def setUp(self):
+        self.app = load_app({'GIT_REPO_URL': 'git@github.com:NCAR/cisl-cloud-charts.git'})
+        self.client = self.app.app.test_client()
+
+    def test_dashboard_is_refused(self):
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()['error']['code'], 'NOT_CONFIGURED')
+
+    def test_the_helm_endpoint_is_refused(self):
+        self.assertEqual(self.client.post('/api/diff', json={}).status_code, 503)
+
+    def test_the_config_dump_is_refused(self):
+        self.assertEqual(self.client.get('/debug').status_code, 503)
+
+    def test_health_answers_but_reports_itself_unready(self):
+        # The regression this guards against is a pod that goes Ready while serving
+        # nothing. /health must still answer (so the reason is readable) but must not
+        # report healthy, or a rollout completes onto pods that refuse every route.
+        response = self.client.get('/health')
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()['status'], 'not_configured')
+
+
+class MisconfigurationTests(unittest.TestCase):
+    def test_half_an_oauth_credential_stops_startup(self):
+        for env in [{'GITHUB_CLIENT_ID': 'cid'}, {'GITHUB_CLIENT_SECRET': 'shh'}]:
+            with self.subTest(env=list(env)):
+                with self.assertRaises(Exception) as caught:
+                    load_app(env)
+                self.assertIn('Refusing to start', str(caught.exception))
+
+    def test_oauth_without_a_redirect_uri_stops_startup(self):
+        # The alternative is deriving it from the Host header, which hands authorization
+        # codes to whatever host the request claims to be for.
+        env = dict(OAUTH_ENV)
+        del env['OAUTH_REDIRECT_URI']
+        with self.assertRaises(Exception) as caught:
+            load_app(env)
+        self.assertIn('OAUTH_REDIRECT_URI', str(caught.exception))
+
+
+class CallbackErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.app = load_app(OAUTH_ENV)
+        self.client = self.app.app.test_client()
+
+    def test_github_error_text_is_not_echoed_onto_the_sign_in_page(self):
+        # Reachable before state validation, so the query string is anyone's to write.
+        response = self.client.get(
+            '/auth/callback?error=access_denied'
+            '&error_description=Call+IT+at+555-0100+to+verify+your+account')
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn(b'555-0100', response.data)
 
 
 if __name__ == '__main__':
