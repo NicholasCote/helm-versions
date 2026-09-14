@@ -55,6 +55,6 @@ oauth:
   #   secret-key:    signs the session cookie; any 32+ byte random string
   #                  (`openssl rand -hex 32`). Changing it signs everyone out.
   secret:
-    secretPath: cirrus/helm-versions      # Path in OpenBao where the secrets are stored
+    secretPath: cirrus-team/helm-versions      # Path in OpenBao where the secrets are stored
     clientSecretKey: client-secret        # Key holding the OAuth App client secret
     sessionKeyKey: secret-key             # Key holding the cookie signing key
