@@ -21,6 +21,7 @@ import threading
 from urllib.parse import urljoin
 
 from chartrefs import is_helm_repo_url, is_oci_repo_url, oci_chart_location
+from githubauth import https_clone_url
 from staleness import (
     NEEDS_UPDATE_TIERS, SEMVER_PATTERN, TIER_ICONS, TIER_LABELS, TIER_ORDER,
     Staleness, classify_staleness, resolve_latest, select_latest_version,
@@ -68,6 +69,10 @@ class ChartInfo:
         self.recompute_staleness()
 
 class HelmChartTracker:
+    # A clone that hasn't finished by now isn't going to; without it a wedged
+    # connection would hold the refresh thread open for the life of the pod.
+    CLONE_TIMEOUT_SECONDS = 120
+
     DEFAULT_CLUSTERS = ['mgmt', 'nwc1', 'mlc1', 'nwc3', 'mlc3']
 
     # Per-cluster app files to read, as (source label, filename). Both use the same
@@ -91,9 +96,13 @@ class HelmChartTracker:
         os.path.join('bootstrap-chart', 'templates'),
     ]
 
-    def __init__(self, git_repo_url: str, ssh_key_path: str = None, clusters: List[str] = None):
+    def __init__(self, git_repo_url: str, ssh_key_path: str = None, clusters: List[str] = None,
+                 github_token: str = None):
         self.git_repo_url = git_repo_url
         self.ssh_key_path = ssh_key_path
+        # A GitHub OAuth token clones over https instead of ssh. Set by the web app from
+        # the signed-in user's session; the CLI leaves it None and uses an ssh key.
+        self.github_token = github_token
         self.clusters = list(clusters) if clusters else list(self.DEFAULT_CLUSTERS)
         self.chart_mappings = {}  # Maps app names to chart info
         # Every version a chart publishes: {(chart_name, repo_url): [version, ...]}.
@@ -198,8 +207,87 @@ class HelmChartTracker:
             print(f"✓ SSH configuration created")
             print(f"✓ GIT_SSH_COMMAND set to: ssh -F {ssh_config_file}")
     
+    def clone_with_token(self, target_dir: str) -> bool:
+        """Clone over https as the signed-in GitHub user
+
+        The token is handed to git through GIT_ASKPASS and an environment variable, which
+        is the one path that keeps it out of everything durable:
+
+          - not in argv, so it can't be read from `ps` by anything else in the pod
+          - not in the URL, so it can't land in git's own error output or a stray
+            .git/config remote
+          - not on disk, so a readOnlyRootFilesystem or a crashed container leaves
+            nothing behind
+
+        The helper script itself holds no secret - it only echoes the variable - so
+        writing it to the temp dir is fine. It supplies both halves of basic auth: the
+        literal username `x-access-token` and the token as the password. See the
+        comment on the script for why the username can't just live in the URL.
+        """
+        clone_url = https_clone_url(self.git_repo_url)
+        if not clone_url:
+            print(f"✗ Not a GitHub URL, can't clone with a token: {self.git_repo_url}")
+            return False
+
+        with tempfile.TemporaryDirectory() as helper_dir:
+            askpass = os.path.join(helper_dir, 'askpass.sh')
+            with open(askpass, 'w') as f:
+                # Answers both prompts, which is why the URL below carries no username.
+                #
+                # It is tempting to put `x-access-token@` in the clone URL and let the
+                # helper supply only the password. git does not work that way: given a
+                # username in the URL it never consults GIT_ASKPASS at all and sends an
+                # empty password, so every clone 401s. Measured against git 2.43 -
+                # username in URL, 0 askpass calls, `x-access-token:` on the wire;
+                # username omitted, 2 calls, `x-access-token:<token>`.
+                f.write('#!/bin/sh\n'
+                        'case "$1" in\n'
+                        '  Username*) printf %s "x-access-token" ;;\n'
+                        '  *) printf %s "$GIT_OAUTH_TOKEN" ;;\n'
+                        'esac\n')
+            os.chmod(askpass, 0o700)
+
+            env = os.environ.copy()
+            env['GIT_ASKPASS'] = askpass
+            env['GIT_OAUTH_TOKEN'] = self.github_token
+            # Never fall through to an interactive prompt: in a container there is no
+            # terminal, and git would otherwise hang instead of failing.
+            env['GIT_TERMINAL_PROMPT'] = '0'
+            # An ssh key left over from a local run must not take precedence here.
+            env.pop('GIT_SSH_COMMAND', None)
+
+            print(f"Cloning repository over https: {clone_url}")
+            try:
+                subprocess.run(['git', 'clone', clone_url, target_dir],
+                               check=True, capture_output=True, text=True, env=env,
+                               timeout=self.CLONE_TIMEOUT_SECONDS)
+            except subprocess.CalledProcessError as e:
+                print(f"✗ Failed to clone {clone_url}: {self.scrub(e.stderr)}")
+                return False
+            except subprocess.TimeoutExpired:
+                print(f"✗ Clone of {clone_url} timed out after {self.CLONE_TIMEOUT_SECONDS}s")
+                return False
+
+        print("✓ Repository cloned successfully")
+        return True
+
+    def scrub(self, text: str) -> str:
+        """Redact the OAuth token from anything headed for a log line
+
+        git shouldn't echo it - the token never reaches argv or the URL - but this is
+        the function whose output goes to stdout in a shared cluster, so it doesn't
+        depend on that holding.
+        """
+        text = text or ''
+        if self.github_token:
+            text = text.replace(self.github_token, '***')
+        return text.strip()
+
     def clone_repo(self, target_dir: str) -> bool:
         """Clone the private git repository to analyze"""
+        if self.github_token:
+            return self.clone_with_token(target_dir)
+
         try:
             self.setup_git_ssh()
             
@@ -1116,6 +1204,17 @@ def parse_args(argv: List[str] = None):
         default=os.getenv('SSH_KEY_PATH', "~/.ssh/id_rsa"),
         help="Path to the SSH private key used for the clone (default: %(default)s)"
     )
+    # The web app gets its token from a signed-in user's OAuth session. The CLI has no
+    # browser to run that flow through, so it takes a personal access token instead -
+    # or keeps using an ssh key, which is still the path of least setup locally.
+    parser.add_argument(
+        '--github-token',
+        default=os.getenv('GITHUB_TOKEN'),
+        help=("GitHub token to clone with over https, instead of an SSH key. "
+              "Defaults to $GITHUB_TOKEN. Pass it via the environment rather than "
+              "on the command line, where it would be visible in `ps` and your shell "
+              "history.")
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1137,8 +1236,11 @@ def main():
 
     tracker = HelmChartTracker(
         git_repo_url=args.repo_url,
-        ssh_key_path=args.ssh_key_path,  # Path to your SSH private key
-        clusters=args.clusters
+        # A token clones over https and makes the ssh key irrelevant; don't hand over
+        # both and leave which one authenticated ambiguous.
+        ssh_key_path=None if args.github_token else args.ssh_key_path,
+        clusters=args.clusters,
+        github_token=args.github_token,
     )
     
     print("Analyzing Helm charts across clusters: %s" % ', '.join(tracker.clusters))

@@ -3,28 +3,86 @@
 Flask Web Application for Helm Chart Version Tracker
 """
 
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import (Flask, render_template, jsonify, request, redirect, session,
+                   url_for, send_from_directory)
 import json
 import os
+import secrets
+import requests
 from datetime import datetime
+from functools import wraps
 import threading
 import time
 from tracker import HelmChartTracker, clusters_from_env, CLUSTERS_ENV_VAR  # Import your existing tracker
 from staleness import TIER_ICONS, TIER_LABELS, TIER_ORDER, semver_key
+import githubauth
 import differ
 
 app = Flask(__name__)
+
+GIT_REPO_URL = os.getenv('GIT_REPO_URL', 'git@github.com:NCAR/cisl-cloud-charts.git')
+
+# None when GITHUB_CLIENT_ID/SECRET aren't set. That is the local-development case: the
+# dashboard then behaves exactly as it did before, unauthenticated, driven by an ssh key.
+# It is emphatically not a deployment mode - see require_auth.
+OAUTH = githubauth.config_from_env(GIT_REPO_URL)
+
+# The callback URL registered on the OAuth App. Read here rather than per request
+# because deriving it from the request means trusting Host/X-Forwarded-*, which an
+# attacker can set to point the authorization code at a host they control - and GitHub
+# honors any redirect_uri whose host matches the registered callback's.
+OAUTH_REDIRECT_URI = (os.getenv('OAUTH_REDIRECT_URI') or '').strip()
+
+# Which secrets are present, snapshotted at startup for /debug. Booleans only - the
+# endpoint reports whether a thing is configured, never what it is.
+CONFIG_PRESENT = {
+    'github_client_id': bool(os.getenv('GITHUB_CLIENT_ID')),
+    'github_client_secret': bool(os.getenv('GITHUB_CLIENT_SECRET')),
+    'secret_key': bool(os.getenv('SECRET_KEY')),
+    'ssh_key_path': os.getenv('SSH_KEY_PATH') or 'Not set',
+    'ssh_key_content': bool(os.getenv('SSH_KEY_CONTENT')),
+    'ssh_key_content_base64': bool(os.getenv('SSH_KEY_CONTENT_BASE64')),
+}
+
+# Tokens live here, keyed by an opaque id; the cookie carries only that id.
+token_store = githubauth.TokenStore(
+    ttl_seconds=int(os.getenv('SESSION_TTL_HOURS', '8')) * 3600)
+
+# Signs the session cookie. Generated when unset so a misconfigured deploy still gets a
+# *random* key rather than a predictable one - but every restart then invalidates every
+# session, so set it from a Secret in Kubernetes.
+app.secret_key = os.getenv('SECRET_KEY') or secrets.token_hex(32)
+if not os.getenv('SECRET_KEY') and OAUTH:
+    print("⚠ SECRET_KEY not set - generated a random one. "
+          "Sessions will not survive a restart; set it from a Secret.")
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    # OAuth redirects back over https in any real deployment. Left overridable because
+    # `docker run -p 5000:5000` is plain http and a Secure cookie would never be sent.
+    SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', 'true').lower() != 'false',
+)
 
 # Global variables to store data
 chart_data = {}
 # {(chart_name, repo_url): [version, ...]} - see tracker.version_index()
 chart_versions_index = {}
 last_update = None
+# The GitHub login whose token produced the data currently on screen, so the dashboard
+# can say whose view it is rather than implying it's everyone's.
+last_update_by = None
 update_in_progress = False
 
-def update_chart_data():
-    """Background function to update chart data"""
-    global chart_data, chart_versions_index, last_update, update_in_progress
+def update_chart_data(github_token=None, triggered_by=None):
+    """Background function to update chart data
+
+    `github_token` is the OAuth token of whoever clicked Refresh; the clone runs as
+    them. One dashboard is shared by everyone signed in, so it shows whatever that
+    person could see - which is the same set of clusters for anyone in the allowed
+    team, but it is why the payload records who fetched it.
+    """
+    global chart_data, chart_versions_index, last_update, update_in_progress, last_update_by
     
     update_in_progress = True
     # Chart releases are immutable, so cached renders can't go stale within a run -
@@ -33,15 +91,19 @@ def update_chart_data():
     differ.clear_render_cache()
     try:
         # Get configuration from environment variables
-        git_repo_url = os.getenv('GIT_REPO_URL', 'git@github.com:NCAR/cisl-cloud-charts.git')
-        ssh_key_path = os.getenv('SSH_KEY_PATH')  # Don't provide default here
+        git_repo_url = GIT_REPO_URL
+        ssh_key_path = None if github_token else os.getenv('SSH_KEY_PATH')
         clusters = clusters_from_env()  # None means "all known clusters"
         
         print(f"Starting chart analysis with repo: {git_repo_url}")
         print(f"Clusters: {', '.join(clusters) if clusters else 'all (%s not set)' % CLUSTERS_ENV_VAR}")
-        print(f"SSH key path: {ssh_key_path}")
-        print(f"SSH_KEY_CONTENT_BASE64 set: {bool(os.getenv('SSH_KEY_CONTENT_BASE64'))}")
-        print(f"SSH_KEY_CONTENT set: {bool(os.getenv('SSH_KEY_CONTENT'))}")
+        if github_token:
+            print(f"Auth: GitHub OAuth token for {triggered_by}")
+        else:
+            print(f"Auth: SSH key (no OAuth session)")
+            print(f"SSH key path: {ssh_key_path}")
+            print(f"SSH_KEY_CONTENT_BASE64 set: {bool(os.getenv('SSH_KEY_CONTENT_BASE64'))}")
+            print(f"SSH_KEY_CONTENT set: {bool(os.getenv('SSH_KEY_CONTENT'))}")
         
         # Only check file path if using SSH_KEY_PATH (not environment content)
         if ssh_key_path and not os.getenv('SSH_KEY_CONTENT') and not os.getenv('SSH_KEY_CONTENT_BASE64'):
@@ -54,7 +116,8 @@ def update_chart_data():
         tracker = HelmChartTracker(
             git_repo_url=git_repo_url,
             ssh_key_path=ssh_key_path,  # Pass None if not set
-            clusters=clusters
+            clusters=clusters,
+            github_token=github_token,
         )
         
         print("Analyzing charts...")
@@ -74,10 +137,14 @@ def update_chart_data():
             print(f"📊 Summary: {breakdown}")
         else:
             print("⚠️ No charts found - this might indicate a problem with repository access or parsing")
-            chart_data = {"error": "No charts found. Check repository access and SSH key configuration."}
+            reason = ("Check that your GitHub account can read the repository."
+                      if github_token else
+                      "Check repository access and SSH key configuration.")
+            chart_data = {"error": f"No charts found. {reason}"}
             chart_versions_index = {}
         
         last_update = datetime.now()
+        last_update_by = triggered_by
         print(f"🏁 Chart analysis completed at {last_update}")
         print("=" * 60)
         
@@ -94,6 +161,168 @@ def background_updater():
     """Background thread to periodically update data - DISABLED"""
     # Background updating disabled - user will manually refresh as needed
     pass
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+# Reachable without a session. /health is here so a Kubernetes probe doesn't need a
+# credential; it deliberately reports no chart data. The login routes are obviously
+# exempt, and static assets are the dashboard's own CSS/JS - the login page needs them.
+PUBLIC_ENDPOINTS = {'login', 'callback', 'logout', 'health', 'static', 'static_files'}
+
+
+def current_session():
+    """The signed-in user's session record, or None"""
+    return token_store.get(session.get('sid'))
+
+
+def wants_json():
+    """True when a 401 should be JSON rather than a redirect to GitHub
+
+    fetch() from dashboard.js follows redirects transparently, so answering an expired
+    API call with a 302 to github.com hands the JS an opaque HTML body instead of an
+    error it can act on. The dashboard reads the 401 and shows its own sign-in prompt.
+    """
+    return (request.path.startswith('/api/')
+            or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+            or 'application/json' in (request.headers.get('Accept') or ''))
+
+
+@app.before_request
+def require_auth():
+    """Gate every route that isn't explicitly public.
+
+    Default-deny by endpoint name rather than by path prefix: a route added later is
+    protected unless someone adds it to PUBLIC_ENDPOINTS on purpose. The old code's
+    comment that "the app has no authentication" is what this replaces - the diff
+    endpoint in particular shells out to helm, and was only ever safe because nothing
+    could reach it.
+    """
+    if not OAUTH:
+        # No OAuth configured: local development against an ssh key, unchanged. Refuse
+        # to do this while listening on anything but loopback, because the failure mode
+        # is an open dashboard that runs helm on request.
+        return None
+
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+
+    if current_session():
+        return None
+
+    if wants_json():
+        return jsonify({"error": {"code": "UNAUTHENTICATED",
+                                  "message": "Sign in with GitHub to continue."}}), 401
+
+    return redirect(url_for('login', next=request.path))
+
+
+@app.route('/login')
+def login():
+    """Start the GitHub OAuth flow"""
+    if not OAUTH:
+        return jsonify({"error": "GitHub OAuth is not configured on this server."}), 501
+
+    if current_session():
+        return redirect('/')
+
+    state = githubauth.new_state()
+    session['oauth_state'] = state
+    # Only ever a path on this app, never an absolute URL: an open redirect here would
+    # let a crafted link bounce a signed-in user off-site after login.
+    target = request.args.get('next') or '/'
+    session['next'] = target if target.startswith('/') and not target.startswith('//') else '/'
+
+    return redirect(githubauth.authorize_url(OAUTH, oauth_redirect_uri(), state))
+
+
+def oauth_redirect_uri():
+    """The callback URL to send GitHub, falling back to one derived from the request
+
+    Set OAUTH_REDIRECT_URI in Kubernetes; the derived form is for `docker run` and
+    local development, where the host header is nobody else's to set.
+    """
+    return OAUTH_REDIRECT_URI or url_for('callback', _external=True)
+
+
+@app.route('/auth/callback')
+def callback():
+    """Finish the OAuth flow: verify state, exchange the code, check the team"""
+    if not OAUTH:
+        return jsonify({"error": "GitHub OAuth is not configured on this server."}), 501
+
+    expected_state = session.pop('oauth_state', None)
+    target = session.pop('next', '/')
+
+    if request.args.get('error'):
+        return render_login_error(
+            f"GitHub returned an error: {request.args.get('error_description') or request.args['error']}",
+            status=401)
+
+    # Compared with compare_digest rather than != so a mismatch can't be narrowed by
+    # timing, and rejected outright when either side is missing - a callback with no
+    # state in the session is a CSRF attempt or a stale bookmark, not a login.
+    state = request.args.get('state', '')
+    if not expected_state or not secrets.compare_digest(state, expected_state):
+        return render_login_error(
+            "That sign-in link has expired or didn't start here. Try again.", status=400)
+
+    code = request.args.get('code')
+    if not code:
+        return render_login_error("GitHub didn't send an authorization code.", status=400)
+
+    try:
+        token = githubauth.exchange_code(OAUTH, code, oauth_redirect_uri())
+        user = githubauth.fetch_user(token)
+        githubauth.assert_team_member(token, OAUTH, user['login'])
+    except githubauth.AuthError as e:
+        return render_login_error(e.message, status=e.status)
+    except requests.RequestException as e:
+        return render_login_error(f"Couldn't reach GitHub: {e}", status=502)
+
+    # New session id on every login, so a session id captured before sign-in can't be
+    # reused after it.
+    session.clear()
+    session['sid'] = token_store.create(token, user)
+    session.permanent = False
+
+    print(f"✓ {user['login']} signed in ({OAUTH.team_slug})")
+    return redirect(target)
+
+
+@app.route('/logout', methods=['GET', 'POST'])
+def logout():
+    """Drop the server-side token and clear the cookie"""
+    record = current_session()
+    token_store.drop(session.get('sid'))
+    session.clear()
+    if record:
+        print(f"✓ {record['login']} signed out")
+    return redirect(url_for('login'))
+
+
+def render_login_error(message, status=403):
+    """The sign-in page, with a reason the attempt didn't work"""
+    return render_template('login.html', error=message,
+                           team=OAUTH.team_slug if OAUTH else None), status
+
+
+@app.route('/api/me')
+def api_me():
+    """Who's signed in, for the dashboard header"""
+    record = current_session()
+    if not record:
+        return jsonify({"authenticated": False, "oauth_enabled": bool(OAUTH)})
+    return jsonify({
+        "authenticated": True,
+        "oauth_enabled": True,
+        "login": record['login'],
+        "name": record['name'],
+        "avatar_url": record['avatar_url'],
+        "team": OAUTH.team_slug,
+    })
+
 
 @app.route('/')
 def index():
@@ -113,18 +342,35 @@ def api_charts():
     response = {
         'data': chart_data,
         'last_update': last_update.isoformat() if last_update else None,
+        'last_update_by': last_update_by,
         'update_in_progress': update_in_progress
     }
     return jsonify(response)
 
 @app.route('/api/refresh', methods=['POST'])
 def api_refresh():
-    """API endpoint to trigger a manual refresh"""
-    if not update_in_progress:
-        threading.Thread(target=update_chart_data, daemon=True).start()
-        return jsonify({"status": "refresh_started"})
-    else:
+    """API endpoint to trigger a manual refresh
+
+    The clone runs with the caller's own GitHub token. The token is read out of the
+    store here, on the request thread, and handed to the worker as an argument rather
+    than left for it to look up: the worker outlives the request, and by the time it
+    clones, the user may have signed out and dropped the session.
+    """
+    record = current_session()
+
+    if update_in_progress:
         return jsonify({"status": "update_in_progress"})
+
+    if OAUTH and not record:
+        return jsonify({"error": {"code": "UNAUTHENTICATED",
+                                  "message": "Sign in with GitHub to refresh."}}), 401
+
+    threading.Thread(
+        target=update_chart_data,
+        kwargs={'github_token': record['token'] if record else None,
+                'triggered_by': record['login'] if record else None},
+        daemon=True).start()
+    return jsonify({"status": "refresh_started"})
 
 # Which HTTP status each helm failure maps to
 DIFF_ERROR_STATUS = {
@@ -153,10 +399,14 @@ def chart_catalog_entry(chart_name, repo_url):
     """The first dashboard entry matching a chart/repo pair, or None
 
     This is the allowlist: the diff endpoint executes a binary that makes outbound
-    requests, and the app has no authentication, so it will only ever render charts
-    the dashboard is already tracking. That closes off both SSRF (an arbitrary
-    repo_url fetched by helm from inside the cluster) and rendering an
-    attacker-chosen chart.
+    requests, so it will only ever render charts the dashboard is already tracking.
+    That closes off both SSRF (an arbitrary repo_url fetched by helm from inside the
+    cluster) and rendering an attacker-chosen chart.
+
+    Still enforced now that the app authenticates. Sign-in narrows who can reach the
+    endpoint to the allowed team; it does not make an arbitrary repo_url safe to hand
+    to a subprocess, and defence that only holds while every caller is trusted is not
+    defence.
     """
     for chart in iter_charts(chart_data):
         if chart.get('chart_name') == chart_name and chart.get('repo_url') == repo_url:
@@ -284,20 +534,33 @@ def health():
 
 @app.route('/debug')
 def debug():
-    """Debug endpoint to check configuration"""
+    """Debug endpoint to check configuration
+
+    Behind require_auth, so only the allowed team can read it - but it is still a
+    configuration dump, so it reports whether each secret is *set*, never its value.
+    """
     debug_info = {
-        "git_repo_url": os.getenv('GIT_REPO_URL', 'Not set'),
-        "ssh_key_path": os.getenv('SSH_KEY_PATH', 'Not set'),
+        "git_repo_url": GIT_REPO_URL,
         "clusters": os.getenv(CLUSTERS_ENV_VAR, 'Not set (all clusters)'),
-        "ssh_key_content_set": bool(os.getenv('SSH_KEY_CONTENT')),
+        "oauth_enabled": bool(OAUTH),
+        "oauth_team": OAUTH.team_slug if OAUTH else 'Not set',
+        "oauth_client_id_set": CONFIG_PRESENT['github_client_id'],
+        "oauth_client_secret_set": CONFIG_PRESENT['github_client_secret'],
+        "oauth_redirect_uri": OAUTH_REDIRECT_URI or 'derived from request',
+        "secret_key_set": CONFIG_PRESENT['secret_key'],
+        "active_sessions": len(token_store),
+        "signed_in_as": (current_session() or {}).get('login'),
+        "ssh_key_path": CONFIG_PRESENT['ssh_key_path'],
+        "ssh_key_content_set": CONFIG_PRESENT['ssh_key_content'],
+        "ssh_key_content_base64_set": CONFIG_PRESENT['ssh_key_content_base64'],
         "update_in_progress": update_in_progress,
         "chart_data_keys": list(chart_data.keys()) if chart_data else None,
         "last_update": last_update.isoformat() if last_update else None,
+        "last_update_by": last_update_by,
         "helm_version": differ.helm_version(),
         "helm_binary": differ.HELM_BINARY,
         "charts_with_version_lists": len(chart_versions_index),
         "working_directory": os.getcwd(),
-        "ssh_key_file_exists": os.path.exists(os.path.expanduser(os.getenv('SSH_KEY_PATH', '/app/.ssh/id_rsa'))) if os.getenv('SSH_KEY_PATH') else False
     }
     return jsonify(debug_info)
 
@@ -305,12 +568,20 @@ if __name__ == '__main__':
     # Create static directory if it doesn't exist
     os.makedirs('static', exist_ok=True)
     
-    # Start initial data load in background (non-blocking)
-    print("Starting initial chart analysis in background...")
-    initial_load_thread = threading.Thread(target=update_chart_data, daemon=True)
-    initial_load_thread.start()
+    # With OAuth on there is no credential to clone with until somebody signs in and
+    # clicks Refresh, so the startup load is skipped rather than failing noisily on
+    # every boot. Without OAuth the ssh key is present at startup and this behaves as
+    # it always did.
+    if OAUTH:
+        print(f"GitHub OAuth enabled - access limited to the {OAUTH.team_slug} team.")
+        print("Waiting for a signed-in user to trigger the first analysis.")
+    else:
+        print("⚠ GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET not set - the dashboard is "
+              "UNAUTHENTICATED. Do not expose this beyond localhost.")
+        print("Starting initial chart analysis in background...")
+        threading.Thread(target=update_chart_data, daemon=True).start()
     
     # Start Flask app immediately
     port = int(os.getenv('PORT', 5000))
-    print(f"Flask app starting on port {port} - chart analysis running in background")
+    print(f"Flask app starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)

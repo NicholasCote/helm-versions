@@ -7,7 +7,8 @@ graded by how far behind, with a one-click diff of what an upgrade actually chan
 
 ## How it works
 
-1. Clones `GIT_REPO_URL` into a temp dir over SSH.
+1. Clones `GIT_REPO_URL` into a temp dir — over https as the signed-in GitHub user when
+   [OAuth](#authentication) is configured, or over SSH with a key when it isn't.
 2. Parses `infra-chart/templates/*.yaml` and `bootstrap-chart/templates/*.yaml` (Argo
    `Application` templates) to map each app name to its `chart` + `repoURL`. App names come
    from the `{{- if .Values.apps.NAME.enable }}` guard on the template's first line. Missing
@@ -100,22 +101,104 @@ since most charts interpolate `.Release.Name` into their fullname template, that
 every resource name and label — measured at ~40% of the workflow's diff output, and 481
 spurious lines when diffing `ingress-nginx` 4.11.0 against itself. Worth fixing there too.
 
-The endpoint is unauthenticated like the rest of the app, so it only renders charts that
-appear in the current dashboard data, and validates every field before it reaches
-`subprocess`. That makes it safe for an internal tool, not safe to expose — put
-oauth2-proxy or ingress auth in front if the dashboard is reachable more widely.
+The endpoint only renders charts that appear in the current dashboard data, and validates
+every field before it reaches `subprocess`. Both checks still apply now that the app
+authenticates: signing in narrows *who* can reach the endpoint, it doesn't make an
+arbitrary `repo_url` safe to hand to a subprocess.
 
 The known cluster list is `HelmChartTracker.DEFAULT_CLUSTERS` in `app/tracker.py`
 (`mgmt`, `nwc1`, `mlc1`, `nwc3`, `mlc3`). All of them are analyzed unless you narrow the
 selection with the `CLUSTERS` env var or the CLI's `--cluster` flag. Adding a genuinely new
 cluster still means editing `DEFAULT_CLUSTERS`.
 
+## Authentication
+
+The dashboard signs users in with GitHub and limits access to one GitHub team. The same
+sign-in does double duty: the OAuth token it produces is also what clones `GIT_REPO_URL`,
+so there is no deploy key or SSH secret in the cluster at all.
+
+Set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` to turn it on. **With them unset the
+app serves the dashboard with no authentication whatsoever** — that is the local
+development mode, and it prints a warning at startup. Don't expose that beyond localhost;
+`/api/diff` runs `helm` on request.
+
+### How access is decided
+
+1. The user is sent to GitHub and grants the `repo` and `read:org` scopes.
+2. The callback exchanges the code for an access token and reads the user's profile.
+3. `GET /orgs/<org>/teams/<team>/memberships/<user>` must come back `active`. A `pending`
+   invitation is refused with a message saying to accept it; a non-member, a team that
+   doesn't exist, and a secret team the user can't see are indistinguishable over the API
+   and all collapse into one "you're not a member" denial.
+4. The token is stored **server-side** and the browser gets an opaque session id.
+
+Step 4 matters: Flask's session cookie is *signed, not encrypted*, so anything put in it
+is readable by whoever holds the cookie. A `repo`-scoped token is write-capable against
+every repository that user can reach, so it never goes near the browser. It lives in
+process memory, which means **sessions don't survive a restart and don't work across
+replicas — run this with `replicas: 1`**, or swap `TokenStore` for a shared backend.
+
+### Why an OAuth App and not a GitHub App
+
+A GitHub App's user-to-server tokens would be tighter — fine-grained, repo-scoped and
+expiring — but they only reach repositories the *installation* covers, which puts an
+install step and an org-admin approval between the team and a working dashboard. The
+tradeoff is that OAuth App scopes are coarse: `repo` is read **and write** on every
+repository the user can reach. The app never writes, and the token is never written to
+disk, never placed in `argv` and never sent to the browser, but it's worth knowing what
+you're granting.
+
+### Setting up the OAuth App
+
+On GitHub, **Settings → Developer settings → OAuth Apps → New OAuth App**:
+
+| Field | Value |
+| --- | --- |
+| Homepage URL | `https://helm-versions.example.org` |
+| Authorization callback URL | `https://helm-versions.example.org/auth/callback` |
+
+The callback must match `OAUTH_REDIRECT_URI` exactly. Set that variable explicitly in
+Kubernetes rather than letting the app derive it from the request — deriving it means
+trusting the `Host` / `X-Forwarded-*` headers, which an attacker can set to point the
+authorization code at a host they control.
+
+### How the token reaches git
+
+Not through the URL and not through `argv`. `argv` is readable through `/proc` by
+anything else in the pod, and a credential in the clone URL gets written into
+`.git/config` and echoed back in git's own error messages. Instead the token goes in an
+environment variable and git reads it through a `GIT_ASKPASS` helper, which is deleted
+with its temp dir when the clone finishes.
+
+One non-obvious detail, since it looks like a simplification waiting to happen: the clone
+URL carries **no username**. Given `https://x-access-token@github.com/...`, git decides it
+has a complete credential, never calls `GIT_ASKPASS`, and sends an *empty* password — so
+every clone 401s. With the username omitted, git asks the helper for both halves and
+authenticates correctly. Measured against git 2.43.
+
+### Whose data is on the dashboard
+
+The clone runs with the token of whoever clicked **Refresh**, and there is one shared
+dashboard — so the data everyone sees is whatever that person could see. For a team that
+all has access to the same config repo this is a distinction without a difference, but
+it's why `/api/charts` reports `last_update_by` and the header shows who you're signed in
+as. Nothing is analyzed until someone signs in and refreshes; with OAuth on there is no
+credential at startup to clone with.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `GIT_REPO_URL` | no | `git@github.com:NCAR/cisl-cloud-charts.git` | Repo to clone and analyze. |
-| `SSH_KEY_CONTENT_BASE64` | one of the three | — | Base64-encoded SSH private key. Preferred for Kubernetes Secrets. |
+| `GIT_REPO_URL` | no | `git@github.com:NCAR/cisl-cloud-charts.git` | Repo to clone and analyze. Accepts `git@`, `https://` or `ssh://` form; it's normalized to https when cloning with a token. |
+| `GITHUB_CLIENT_ID` | for OAuth | — | OAuth App client id. Setting this **and** the secret enables authentication. |
+| `GITHUB_CLIENT_SECRET` | for OAuth | — | OAuth App client secret. |
+| `GITHUB_ALLOWED_TEAM` | no | `NCAR/cirrus-admins` | Team whose members may sign in, as `org/team`. A bare `team` takes the org from `GIT_REPO_URL`. |
+| `OAUTH_REDIRECT_URI` | recommended | derived from request | Must equal the OAuth App's callback URL. Set it explicitly in Kubernetes. |
+| `SECRET_KEY` | recommended | random per start | Signs the session cookie. Unset means every restart signs everyone out. |
+| `SESSION_TTL_HOURS` | no | `8` | How long a sign-in lasts before it has to be repeated. |
+| `SESSION_COOKIE_SECURE` | no | `true` | Set to `false` only to run over plain http locally; the cookie is otherwise never sent. |
+| `GITHUB_TOKEN` | no | — | **CLI only.** Personal access token to clone with, instead of an SSH key. The web app uses the signed-in user's token and ignores this. |
+| `SSH_KEY_CONTENT_BASE64` | one of the three | — | Base64-encoded SSH private key. Local/CLI use; unnecessary when OAuth is configured. |
 | `SSH_KEY_CONTENT` | one of the three | — | Raw PEM SSH private key, including header/footer lines. |
 | `SSH_KEY_PATH` | one of the three | — | Path to an SSH private key file already present in the container. |
 | `CLUSTERS` | no | all clusters | Comma-separated subset of clusters to analyze, e.g. `mlc1` or `mlc1,nwc3`. Unknown names abort the run. |
@@ -136,6 +219,11 @@ an `emptyDir` at `/tmp/helm`.
 `FLASK_APP` and `PYTHONPATH` are set in the Dockerfile and don't need to be supplied.
 
 ### SSH key precedence
+
+SSH is the fallback for local runs and the CLI, which has no browser to run an OAuth flow
+through. When a GitHub token is present — the signed-in user's in the web app, or
+`GITHUB_TOKEN`/`--github-token` on the CLI — the clone goes over https and every variable
+below is ignored.
 
 Only one of the three key variables is used, in this order:
 
@@ -213,16 +301,76 @@ docker run --rm \
 
 `--cluster` takes precedence over `CLUSTERS`, is repeatable (`-c mlc1 -c nwc3`), and also
 accepts a comma-separated list. `python tracker.py --help` lists the rest (`--repo-url`,
-`--ssh-key-path`), which default to their env var equivalents.
+`--ssh-key-path`, `--github-token`), which default to their env var equivalents.
+
+The CLI has no browser to run an OAuth flow through, so it authenticates with an SSH key
+or a personal access token. Prefer the environment over the flag — an argument is visible
+in `ps` and in your shell history:
+
+```bash
+docker run --rm -e GITHUB_TOKEN helm-versions python tracker.py --cluster mlc1
+```
 
 ### Kubernetes
 
+With OAuth there is no git credential in the cluster — only the OAuth App's own client
+secret and a cookie signing key:
+
+```bash
+kubectl create secret generic helm-versions-oauth \
+  --from-literal=client-id=Iv1.xxxxxxxxxxxx \
+  --from-literal=client-secret=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --from-literal=secret-key="$(openssl rand -hex 32)"
+```
+
+```yaml
+spec:
+  # Sessions are held in process memory, so a second replica would sign users out at
+  # random as requests landed on the pod that didn't have their session.
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: helm-versions
+          env:
+            - name: GIT_REPO_URL
+              value: git@github.com:NCAR/cisl-cloud-charts.git
+            - name: CLUSTERS
+              value: mlc1,nwc3
+            - name: GITHUB_ALLOWED_TEAM
+              value: NCAR/cirrus-admins
+            - name: OAUTH_REDIRECT_URI
+              value: https://helm-versions.example.org/auth/callback
+            - name: GITHUB_CLIENT_ID
+              valueFrom:
+                secretKeyRef: { name: helm-versions-oauth, key: client-id }
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: helm-versions-oauth, key: client-secret }
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: helm-versions-oauth, key: secret-key }
+          readinessProbe:
+            httpGet: { path: /health, port: 5000 }
+          volumeMounts:
+            - { name: helm-tmp, mountPath: /tmp/helm }
+      volumes:
+        - name: helm-tmp
+          emptyDir: {}
+```
+
+`/health` is deliberately reachable without a session so probes don't need a credential;
+it reports no chart data. Everything else is default-deny.
+
+#### With an SSH key instead (no OAuth)
+
+Kubernetes already base64-encodes Secret values in `data:`. Store the *already
+base64-encoded key* as the secret value so the app receives base64 after Kubernetes decodes
+its own layer — i.e. double-encode when creating with `data:`, or use `stringData:` with the
+single-encoded key.
+
 ```yaml
 env:
-  - name: GIT_REPO_URL
-    value: git@github.com:NCAR/cisl-cloud-charts.git
-  - name: CLUSTERS
-    value: mlc1,nwc3
   - name: SSH_KEY_CONTENT_BASE64
     valueFrom:
       secretKeyRef:
@@ -230,10 +378,8 @@ env:
         key: ssh-privatekey-base64
 ```
 
-Note that Kubernetes already base64-encodes Secret values in `data:`. Store the *already
-base64-encoded key* as the secret value so the app receives base64 after Kubernetes decodes
-its own layer — i.e. double-encode when creating with `data:`, or use `stringData:` with the
-single-encoded key.
+Leaving `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` unset serves the dashboard with **no
+authentication**. Put something in front of it if you do this.
 
 ## Dashboard
 
@@ -261,15 +407,29 @@ actually analyzed — use those to make the run faster, and the dropdown to focu
 | `/api/refresh` | POST | Kicks off a re-analysis in a background thread. |
 | `/api/versions` | GET | Versions available for one chart (`?chart=&repo=`), for the diff version picker. Served separately so `/api/charts` doesn't carry hundreds of tags per chart on every poll. |
 | `/api/diff` | POST | Unified diff between two versions of a chart. Body: `chart_name`, `repo_url`, `old_version`, `new_version`. Synchronous — two renders of even a very large chart take a few seconds. |
-| `/health` | GET | Liveness/readiness check. |
-| `/debug` | GET | Reports which config vars are set and whether the key file exists. |
+| `/api/me` | GET | Who's signed in, for the header badge. |
+| `/login` | GET | Starts the GitHub OAuth flow. Public. |
+| `/auth/callback` | GET | OAuth callback: verifies state, exchanges the code, checks team membership. Public. |
+| `/logout` | GET, POST | Drops the server-side token and clears the cookie. Public. |
+| `/health` | GET | Liveness/readiness check. **Public** so probes need no credential; reports no chart data. |
+| `/debug` | GET | Reports which config vars are set — booleans only, never values. |
+
+Every path not marked Public requires a session when OAuth is configured. The gate is
+default-deny by endpoint name, so a route added later is protected unless someone adds it
+to `PUBLIC_ENDPOINTS` on purpose. Requests under `/api/` get a `401` with a JSON body
+rather than a redirect, because `fetch()` follows redirects transparently and the
+dashboard needs an error it can act on.
 
 ## Refresh behavior
 
-An initial analysis starts in a background thread at boot, so the app serves immediately
-while data is still loading. Periodic auto-refresh is **disabled** (`background_updater()` is
-a no-op) — trigger updates manually via `POST /api/refresh` or the dashboard button. Data is
-held in memory only and is lost on restart.
+Periodic auto-refresh is **disabled** (`background_updater()` is a no-op) — trigger updates
+manually via `POST /api/refresh` or the dashboard button. Data is held in memory only and
+is lost on restart.
+
+Without OAuth, an initial analysis starts in a background thread at boot, so the app serves
+immediately while data is still loading. **With OAuth there is no startup analysis**: the
+clone runs as a signed-in user, and at boot there is nobody signed in. The dashboard is
+empty until the first person signs in and hits Refresh.
 
 ## Running the tests
 
@@ -286,7 +446,16 @@ covers input validation, argv construction for both HTTPS and OCI charts, enviro
 isolation, and helm error classification.
 
 `app/staleness.py` and `app/chartrefs.py` are stdlib-only by design, and `app/differ.py`
-imports no Flask, which is what keeps the tests dependency-free.
+imports no Flask, which is what keeps those tests dependency-free.
+
+The auth tests need what the app already depends on — Flask, PyYAML and `requests` — and
+mock every outbound call; nothing touches the network or runs git.
+`tests/test_githubauth.py` covers URL parsing, the team gate's denial cases and the token
+store's expiry. `tests/test_clone.py` is mostly negative: the token must not appear in
+`argv`, in the clone URL, or in a log line, and the askpass helper must answer the
+username and password prompts *differently*. `tests/test_auth_routes.py` walks the login
+flow end to end against Flask's test client, including the assertion that every route not
+named in `PUBLIC_ENDPOINTS` refuses an anonymous request.
 
 ## Keeping the image patched
 
@@ -330,8 +499,23 @@ one and the image is rebuilt.
 
 - **"No charts found"** — repo cloned but parsing found nothing. Check that `infra-chart/templates/`
   and `clusters/<name>/infraapps.yaml` exist at the expected paths.
-- **Clone fails** — hit `/debug` to confirm which key variable the app sees. Container logs
-  include an `ssh -T git@github.com` auth test before the clone.
+- **Clone fails** — hit `/debug` to confirm which credential the app sees. On the SSH path
+  the container logs include an `ssh -T git@github.com` auth test before the clone; on the
+  OAuth path the log names the user whose token was used.
+- **"redirect_uri_mismatch" from GitHub** — `OAUTH_REDIRECT_URI` doesn't exactly match the
+  OAuth App's registered callback URL. It has to match including scheme and trailing path.
+- **"That sign-in link has expired or didn't start here"** — the CSRF state didn't match.
+  Usually a stale bookmark of `/auth/callback`, a session cookie that was dropped between
+  `/login` and the callback, or a pod restart mid-login with `SECRET_KEY` unset. Start
+  again from `/`.
+- **Signed in, but "you're not a member"** — the check requires *active* membership of
+  `GITHUB_ALLOWED_TEAM`; a pending invitation is refused with its own message. If you are
+  certain the membership is active, confirm the org and team slug (the URL form, not the
+  display name), and that the `read:org` scope was granted.
+- **Everyone gets signed out at random** — more than one replica. Sessions live in process
+  memory; run `replicas: 1`.
+- **Signed out after every deploy** — `SECRET_KEY` is unset, so a new one is generated each
+  start. Set it from a Secret.
 - **A chart shows no latest version** — either no `repoURL`/`chart` was matched in the Argo
   template, or the chart name isn't in that repo's `index.yaml`. Logs print the available
   chart names on a miss.

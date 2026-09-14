@@ -150,14 +150,70 @@ function summarizeClusters(clusters) {
         (totals, cluster) => mergeNumeric(totals, cluster.summary), {});
 }
 
+// Sessions expire server-side (SESSION_TTL_HOURS), so any call can come back 401
+// mid-session. Bounce to the sign-in page rather than rendering an empty dashboard -
+// but only once, or several in-flight requests each trigger their own navigation.
+let redirectingToLogin = false;
+
+function handleUnauthenticated() {
+    if (redirectingToLogin) return;
+    redirectingToLogin = true;
+    window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+}
+
 async function fetchData() {
     try {
         const response = await fetch('/api/charts');
+        if (response.status === 401) {
+            handleUnauthenticated();
+            return { error: 'Session expired. Redirecting to sign in...' };
+        }
         const data = await response.json();
         return data;
     } catch (error) {
         console.error('Error fetching data:', error);
         return { error: error.message };
+    }
+}
+
+// Who's signed in, rendered into the header. Silent on failure: the dashboard works
+// without the badge, and when OAuth is off there is nobody to show.
+async function loadCurrentUser() {
+    try {
+        const response = await fetch('/api/me');
+        if (!response.ok) return;
+        const me = await response.json();
+        if (!me.authenticated) return;
+
+        const section = document.getElementById('userSection');
+        if (!section) return;
+
+        // Built with DOM calls, not innerHTML: login and name come from GitHub and
+        // land in the page verbatim, which is the one thing the chart cards go out of
+        // their way not to do.
+        section.textContent = '';
+
+        if (me.avatar_url) {
+            const avatar = document.createElement('img');
+            avatar.className = 'user-avatar';
+            avatar.src = me.avatar_url;
+            avatar.alt = '';
+            section.appendChild(avatar);
+        }
+
+        const login = document.createElement('span');
+        login.className = 'user-login';
+        login.textContent = me.login;
+        if (me.team) login.title = 'Member of ' + me.team;
+        section.appendChild(login);
+
+        const logout = document.createElement('a');
+        logout.className = 'logout-link';
+        logout.href = '/logout';
+        logout.textContent = 'Sign out';
+        section.appendChild(logout);
+    } catch (error) {
+        /* header badge is cosmetic */
     }
 }
 
@@ -374,7 +430,11 @@ async function refreshData() {
 
     try {
         // Trigger refresh
-        await fetch('/api/refresh', { method: 'POST' });
+        const started = await fetch('/api/refresh', { method: 'POST' });
+        if (started.status === 401) {
+            handleUnauthenticated();
+            return;
+        }
         
         // Poll for updates
         let attempts = 0;
@@ -411,7 +471,7 @@ async function refreshData() {
 
 // Initial load
 async function initializeData() {
-    await checkHelmAvailable();
+    await Promise.all([checkHelmAvailable(), loadCurrentUser()]);
     const data = await fetchData();
     renderData(data);
     

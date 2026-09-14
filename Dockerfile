@@ -34,8 +34,10 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# git and openssh-client are load-bearing - the tracker clones GIT_REPO_URL over SSH -
-# so neither can be dropped to shed their CVEs.
+# git is load-bearing - the tracker clones GIT_REPO_URL. openssh-client is only needed
+# for the SSH key path, which is now the local/CLI fallback: a Kubernetes deployment
+# authenticates with GitHub OAuth and clones over https, and can drop this package.
+# Kept in the default image so `docker run -e SSH_KEY_CONTENT_BASE64=...` still works.
 #
 # The upgrade is the point of this layer. Base image packages go stale between
 # python:3.11-slim rebuilds, and without it the image inherits whatever Debian shipped
