@@ -22,7 +22,7 @@ webapp:
       # Never `latest`: imagePullPolicy is IfNotPresent, so a re-pushed `latest` would
       # never be pulled and the deployment would sit on a stale image while reporting
       # success. An immutable tag per build is what makes a rollout mean anything.
-      tag: ""
+      tag: "64ca06f"
     port: 5000                            # Port the container listens on
     requests:
       memory: 512M                        # Guaranteed memory allocation
