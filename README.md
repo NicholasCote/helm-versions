@@ -79,9 +79,14 @@ an upgrade does to the rendered manifests before taking it.
 This reproduces the team's `Helm Diff` GitHub Actions workflow — that workflow installs the
 helm-diff plugin but never uses it, so its real output is two default-values `helm template`
 renders compared with `diff -u`. None of that needs cluster access, so it runs here in
-seconds instead of minutes in CI. Helm is pinned to **3.14.4** to match the workflow:
-rendered output depends on helm's built-in default `.Capabilities.KubeVersion`, which shifts
-between helm minors.
+seconds instead of minutes in CI. Helm is pinned to **3.22.0** so a rebuild can't quietly
+change every diff — but the pin is not as load-bearing as it once read. The default
+`.Capabilities.KubeVersion` has been frozen at `v1.20.0` in every helm 3.x from 3.14 to
+3.22, and 3.14.4 and 3.22.0 render `ingress-nginx`, `cert-manager`, `argo-cd` and
+`external-dns` byte-for-byte identically. What *does* move between minors is
+`.Capabilities.APIVersions`, which grows with helm's vendored Kubernetes libraries, so
+re-run that comparison before the next bump if any chart gates on
+`.Capabilities.APIVersions.Has`.
 
 Two things to know when reading a diff:
 
@@ -282,6 +287,44 @@ isolation, and helm error classification.
 
 `app/staleness.py` and `app/chartrefs.py` are stdlib-only by design, and `app/differ.py`
 imports no Flask, which is what keeps the tests dependency-free.
+
+## Keeping the image patched
+
+Everything that ships is pinned — `python:3.11-slim` is the one floating reference, and
+it should stay floating so rebuilds pick up base fixes.
+
+`app/requirements.txt` pins the **full** tree, transitive packages included, not just
+Flask/PyYAML/requests. The looser version of this file left Werkzeug, Jinja2, urllib3 and
+certifi unpinned, which is the worst of both worlds: builds weren't reproducible, and the
+packages most likely to carry a CVE were the ones nobody was tracking. Regenerate with:
+
+```bash
+pip install --dry-run --report - Flask PyYAML requests
+```
+
+Deliberately *not* switched to `>=` ranges. Unpinned installs do pick up security fixes at
+build time, but they also mean the image that passes CI isn't the image that ships, and a
+major release lands with no review. Pin, and bump on a schedule (Dependabot or Renovate on
+`app/requirements.txt` and the `HELM_VERSION`/`HELM_SHA256` args does this well).
+
+Three things in the Dockerfile exist only to keep the scan clean, and are easy to
+misread as cruft:
+
+- `apt-get upgrade -y` in the runtime stage. Without it the image inherits whatever
+  Debian shipped on the base image's build date, including fixes that are already
+  published. This is also what makes a no-op rebuild worth running.
+- `pip install --upgrade setuptools` before the requirements install — the base image's
+  copy vendors flagged versions of `jaraco.context` and `wheel`.
+- `pip uninstall setuptools pip` after it. Pip's own vendored tree (`msgpack`, a
+  `pkg_resources` copied from setuptools 70.3.0) is the last thing in the image with
+  fixable CVEs against it, and no pip release fixes them because they *are* pip's
+  vendored copies. Nothing here imports pip or setuptools at runtime. Drop that line if
+  you want an interactive pip back for debugging.
+
+What's left after all of that is `git` and `openssh-client`, which can't go — cloning
+`GIT_REPO_URL` over SSH is the whole first step — plus the `perl` that `git` depends on.
+Their remaining findings have no published Debian fix; they clear when Debian publishes
+one and the image is rebuilt.
 
 ## Troubleshooting
 

@@ -10,6 +10,7 @@ import os
 import yaml
 import requests
 import subprocess
+import time
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -589,6 +590,30 @@ class HelmChartTracker:
     semver_key = staticmethod(semver_key)
     select_latest_version = staticmethod(select_latest_version)
 
+    # Helm repos and OCI registries behind CDNs drop connections often enough that a
+    # single timeout says nothing about whether the chart is reachable. Retry the
+    # transport-level failures only - an HTTP error status is the server answering, and
+    # retrying it just slows the run down.
+    RETRY_ATTEMPTS = 3
+    RETRY_BACKOFF_SECONDS = 2
+
+    def get_with_retries(self, url: str, session=None, **kwargs):
+        """requests.get with retries on timeouts and connection errors"""
+        getter = session.get if session is not None else requests.get
+
+        for attempt in range(1, self.RETRY_ATTEMPTS + 1):
+            try:
+                return getter(url, **kwargs)
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as e:
+                if attempt == self.RETRY_ATTEMPTS:
+                    raise
+                reason = 'Timeout' if isinstance(e, requests.exceptions.Timeout) else 'Connection error'
+                delay = self.RETRY_BACKOFF_SECONDS * attempt
+                print(f"    ⟳ {reason} fetching {url}, "
+                      f"retrying in {delay}s ({attempt}/{self.RETRY_ATTEMPTS - 1})")
+                time.sleep(delay)
+
     def fetch_oci_token(self, session, challenge: str, repository: str) -> Optional[str]:
         """Get an anonymous pull token from a registry's WWW-Authenticate challenge"""
         if not challenge.lower().startswith('bearer '):
@@ -603,7 +628,7 @@ class HelmChartTracker:
         if params.get('service'):
             query['service'] = params['service']
         
-        response = session.get(realm, params=query, timeout=30)
+        response = self.get_with_retries(realm, session=session, params=query, timeout=30)
         response.raise_for_status()
         payload = response.json()
         return payload.get('token') or payload.get('access_token')
@@ -617,7 +642,7 @@ class HelmChartTracker:
         
         # Bounded so a registry with a broken Link header can't loop forever
         for _ in range(20):
-            response = session.get(url, headers=headers, timeout=30)
+            response = self.get_with_retries(url, session=session, headers=headers, timeout=30)
             
             if response.status_code == 401 and 'Authorization' not in headers:
                 token = self.fetch_oci_token(
@@ -705,7 +730,7 @@ class HelmChartTracker:
                 index_url = f"{repo_url}/index.yaml"
             
             print(f"    Fetching index from: {index_url}")
-            response = requests.get(index_url, timeout=30)  # Increased timeout
+            response = self.get_with_retries(index_url, timeout=30)
             response.raise_for_status()
             
             # Parse the raw bytes, not response.text: Helm repos commonly serve
@@ -736,7 +761,8 @@ class HelmChartTracker:
                 return []
             
         except requests.exceptions.Timeout:
-            print(f"    ✗ Timeout fetching from {repo_url}")
+            print(f"    ✗ Timeout fetching from {repo_url} "
+                  f"after {self.RETRY_ATTEMPTS} attempts")
         except requests.exceptions.RequestException as e:
             print(f"    ✗ Request failed for {repo_url}: {e}")
         except yaml.YAMLError as e:

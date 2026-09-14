@@ -1,3 +1,21 @@
-Flask==3.0.0
-PyYAML==6.0.1
-requests==2.32.3
+# Fully pinned, including transitive deps, so the image Trivy scans is the image that
+# was tested. The previous file pinned only these three, which left Werkzeug, Jinja2,
+# urllib3 and certifi floating - not reproducible, and not audited either. Regenerate
+# with: pip install --dry-run --report - Flask PyYAML requests
+
+# Direct
+Flask==3.1.3
+PyYAML==6.0.3
+requests==2.34.2
+
+# Transitive
+blinker==1.9.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+idna==3.19
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+urllib3==2.7.0
+Werkzeug==3.1.8
