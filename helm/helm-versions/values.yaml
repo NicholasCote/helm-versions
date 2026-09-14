@@ -14,7 +14,7 @@ webapp:
     image:
       # Split into repository and tag rather than one string, because CI rewrites the
       # tag on every build and `tag:` is the only key in this file it has to find.
-      repository: hub.k8s.ucar.edu/cirrus/helm-versions
+      repository: hub.k8s.ucar.edu/cirrus-helm-ver/helm-versions
       # Required - there is no sensible default, so rendering fails rather than
       # guessing. Set by .github/workflows/build-push-image.yaml on each push to main;
       # `helm template` before the first build needs --set.
@@ -39,22 +39,22 @@ webapp:
 tracker:
   gitRepoUrl: git@github.com:NCAR/cisl-cloud-charts.git   # Repo to clone and analyze
   clusters: ""                            # Comma-separated subset, e.g. "mlc1,nwc3". Empty = all.
-  sessionTtlHours: 8                      # How long a sign-in lasts before re-authenticating
+  sessionTtlHours: 2                      # How long a sign-in lasts before re-authenticating
 
 oauth:
   # Not a secret: the client id appears in every authorization URL the browser follows.
   # Kept here rather than in OpenBao so the deployed configuration is reviewable in git.
-  clientId: ""                            # OAuth App client id - REQUIRED
+  clientId: "Ov23lieuUqPwnabddA7O"                            # OAuth App client id - REQUIRED
   allowedTeam: NCAR/cirrus-admins         # Only active members of this team may sign in
   # The callback URL is derived from tls.fqdn as https://<fqdn>/auth/callback and must
   # match the OAuth App's registered callback exactly. Set this only to override that.
-  redirectUri: ""
+  redirectUri: "https://helm-versions.k8s.ucar.edu/auth/callback"
 
   # The two values that are secret, pulled from bao.k8s.ucar.edu.
   #   client-secret: the OAuth App's client secret
   #   secret-key:    signs the session cookie; any 32+ byte random string
   #                  (`openssl rand -hex 32`). Changing it signs everyone out.
   secret:
-    secretPath: cirrus-team/helm-versions      # Path in OpenBao where the secrets are stored
+    secretPath: team-cirrus/helm-versions      # Path in OpenBao where the secrets are stored
     clientSecretKey: client-secret        # Key holding the OAuth App client secret
     sessionKeyKey: secret-key             # Key holding the cookie signing key

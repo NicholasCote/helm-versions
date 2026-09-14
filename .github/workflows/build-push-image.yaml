@@ -9,7 +9,7 @@ name: build and push
 on:
   push:
     branches:
-      - main
+      - github-oauth
     paths-ignore:
       # The bump commit below only ever touches helm/. Ignoring that path is what stops
       # this workflow triggering itself - belt to the [skip ci] braces on the commit.
@@ -99,8 +99,8 @@ jobs:
       uses: docker/login-action@v3
       with:
         registry: ${{ env.REGISTRY }}            # derived from the chart's values.yaml
-        username: ${{ secrets.hub_user }}        # robot account for your project
-        password: ${{ secrets.hub_password }}    # set up in the github CI settings
+        username: ${{ secrets.HARBOR_USERNAME }}        # robot account for your project
+        password: ${{ secrets.HARBOR_PASSWORD }}    # set up in the github CI settings
 
     - name: Build
       uses: docker/build-push-action@v6
