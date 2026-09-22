@@ -3,8 +3,8 @@
 Flask Web Application for Helm Chart Version Tracker
 """
 
-from flask import (Flask, render_template, jsonify, request, redirect, session,
-                   url_for, send_from_directory)
+from flask import (Flask, make_response, render_template, jsonify, request, redirect,
+                   session, url_for, send_from_directory)
 import json
 import os
 import secrets
@@ -74,6 +74,14 @@ if OAUTH and not OAUTH_REDIRECT_URI:
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
+    # Not Werkzeug's default `session`. Every Flask app on a shared parent domain writes
+    # a cookie by that name, and a browser holding one scoped to a parent of this host -
+    # or left over from an earlier deploy signed with a different SECRET_KEY - sends it
+    # in the same header as ours. Werkzeug reads the first `session` it finds, so the
+    # wrong one can win and the OAuth state disappears between /login and the callback.
+    # A name only this app uses can't be shadowed, and it orphans any stale `session`
+    # cookie already in the browser rather than fighting it for the slot.
+    SESSION_COOKIE_NAME='helm_versions_session',
     # OAuth redirects back over https in any real deployment. Left overridable because
     # `docker run -p 5000:5000` is plain http and a Secure cookie would never be sent.
     SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', 'true').lower() != 'false',
@@ -241,6 +249,32 @@ def require_auth():
     return redirect(url_for('login', next=request.path))
 
 
+# How many sign-ins one browser may have in flight at once. A person clicking the button
+# starts one - but a browser that prefetches or prerenders the sign-in link starts one
+# before they have clicked anything, and a second tab or a back-button retry starts
+# another. Chrome does that prediction from history, which is exactly why this shows up
+# in a normal profile and never in a fresh incognito window. Holding only the newest
+# state threw away the one the person actually followed, and GitHub then handed the
+# callback a state this session no longer recognized. Each state is still single-use and
+# still dies with the session - this widens the window, not the lifetime.
+MAX_PENDING_STATES = 4
+
+
+def state_matches(received: str, pending) -> bool:
+    """True when the callback's state is one this session actually issued.
+
+    compare_digest rather than `in` or `!=`, so a mismatch can't be narrowed by timing,
+    and over UTF-8 bytes because its str form refuses non-ASCII outright: a callback
+    carrying a non-ASCII state is a crafted link, and it should be turned away like any
+    other bad state rather than raising TypeError into a 500.
+    """
+    if not received or not pending:
+        return False
+    received_bytes = received.encode('utf-8', 'surrogatepass')
+    return any(secrets.compare_digest(received_bytes, issued.encode('utf-8', 'surrogatepass'))
+               for issued in pending if isinstance(issued, str))
+
+
 @app.route('/login')
 def login():
     """Start the GitHub OAuth flow"""
@@ -251,13 +285,19 @@ def login():
         return redirect('/')
 
     state = githubauth.new_state()
-    session['oauth_state'] = state
+    pending = [s for s in session.get('oauth_states') or [] if isinstance(s, str)]
+    session['oauth_states'] = (pending + [state])[-MAX_PENDING_STATES:]
     # Only ever a path on this app, never an absolute URL: an open redirect here would
     # let a crafted link bounce a signed-in user off-site after login.
     target = request.args.get('next') or '/'
     session['next'] = target if target.startswith('/') and not target.startswith('//') else '/'
 
-    return redirect(githubauth.authorize_url(OAUTH, oauth_redirect_uri(), state))
+    # Nothing may cache this redirect. Replaying a stored copy sends someone to GitHub
+    # carrying a state from a session that has already spent it, which fails the callback
+    # check for a reason nothing they can see in their browser explains.
+    response = redirect(githubauth.authorize_url(OAUTH, oauth_redirect_uri(), state))
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 def oauth_redirect_uri():
@@ -276,8 +316,9 @@ def callback():
     if not OAUTH:
         return jsonify({"error": "GitHub OAuth is not configured on this server."}), 501
 
-    expected_state = session.pop('oauth_state', None)
+    pending_states = session.pop('oauth_states', None) or []
     target = session.pop('next', '/')
+    had_cookie = app.config['SESSION_COOKIE_NAME'] in request.cookies
 
     if request.args.get('error'):
         # Logged rather than rendered. This runs before state is validated, so anyone
@@ -289,11 +330,19 @@ def callback():
         return render_login_error(
             "GitHub didn't complete the sign-in. Try again.", status=401)
 
-    # Compared with compare_digest rather than != so a mismatch can't be narrowed by
-    # timing, and rejected outright when either side is missing - a callback with no
-    # state in the session is a CSRF attempt or a stale bookmark, not a login.
+    # A callback whose state this session never issued is a CSRF attempt or a stale
+    # bookmark, not a login, and is refused either way.
     state = request.args.get('state', '')
-    if not expected_state or not secrets.compare_digest(state, expected_state):
+    if not state_matches(state, pending_states):
+        # The one cause here that isn't an attack is a session cookie that didn't
+        # survive the trip to GitHub, and from the page the user sees the two are
+        # indistinguishable - so record which it looked like. No cookie at all means the
+        # browser never stored ours or dropped it; a cookie with nothing pending means it
+        # carried a *different* session than the one /login wrote to, which is the shape
+        # a stale or shadowed cookie leaves behind.
+        print(f"✗ OAuth callback state rejected: cookie="
+              f"{'present' if had_cookie else 'absent'}, states_pending={len(pending_states)}, "
+              f"state_param={'present' if state else 'absent'}")
         return render_login_error(
             "That sign-in link has expired or didn't start here. Try again.", status=400)
 
@@ -332,9 +381,17 @@ def logout():
 
 
 def render_login_error(message, status=403):
-    """The sign-in page, with a reason the attempt didn't work"""
-    return render_template('login.html', error=message,
-                           team=OAUTH.team_slug if OAUTH else None), status
+    """The sign-in page, with a reason the attempt didn't work
+
+    Uncacheable: the reason belongs to one attempt, and a stored copy would show it
+    again on the sign-in URL to whoever tried next.
+    """
+    response = make_response(
+        render_template('login.html', error=message,
+                        team=OAUTH.team_slug if OAUTH else None),
+        status)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/me')

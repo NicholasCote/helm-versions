@@ -527,10 +527,30 @@ one and the image is rebuilt.
   Both are deliberate refusals; the message names which.
 - **"redirect_uri_mismatch" from GitHub** — `OAUTH_REDIRECT_URI` doesn't exactly match the
   OAuth App's registered callback URL. It has to match including scheme and trailing path.
-- **"That sign-in link has expired or didn't start here"** — the CSRF state didn't match.
-  Usually a stale bookmark of `/auth/callback`, a session cookie that was dropped between
-  `/login` and the callback, or a pod restart mid-login with `SECRET_KEY` unset. Start
-  again from `/`.
+- **"That sign-in link has expired or didn't start here"** — the CSRF state didn't match:
+  the session cookie the callback presented isn't the one `/login` wrote the state into.
+  It is never an org, team or scope problem — the check runs before GitHub is called at
+  all, and those failures have their own messages further down this list.
+
+  The pod logs a line per rejection saying which shape it was:
+
+  ```
+  ✗ OAuth callback state rejected: cookie=absent, states_pending=0, state_param=present
+  ```
+
+  - `cookie=absent` — the browser never sent one. A stale bookmark or a reloaded
+    `/auth/callback` URL looks like this; so does a browser or extension blocking the
+    cookie. Start again from `/`.
+  - `cookie=present, states_pending=0` — a cookie arrived, but not the one `/login` wrote.
+    That means a *different* `helm_versions_session` cookie is being sent: one left from a
+    deploy signed with a different `SECRET_KEY`, or one scoped to a parent domain. Clear
+    cookies for the dashboard's host and sign in again.
+
+  A browser that prefetches or prerenders the sign-in link — Chrome does, for URLs in its
+  history, which is why this reproduces in a normal profile and never in incognito — used
+  to cause this too, by starting a second `/login` and replacing the state the person's own
+  click was about to use. The session now holds the last `MAX_PENDING_STATES` it issued,
+  so the one actually followed is still accepted.
 - **Signed in, but "you're not a member"** — the check requires *active* membership of
   `GITHUB_ALLOWED_TEAM`; a pending invitation is refused with its own message. If you are
   certain the membership is active, confirm the org and team slug (the URL form, not the

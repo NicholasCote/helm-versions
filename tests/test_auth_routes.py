@@ -117,15 +117,69 @@ class LoginFlowTests(unittest.TestCase):
 
     def test_callback_with_a_mismatched_state_is_rejected(self):
         with self.client.session_transaction() as session:
-            session['oauth_state'] = 'real-state'
+            session['oauth_states'] = ['real-state']
         response = self.client.get('/auth/callback?code=abc&state=forged')
         self.assertEqual(response.status_code, 400)
+
+    def test_a_non_ascii_state_is_refused_rather_than_raising(self):
+        # compare_digest's str form rejects non-ASCII with TypeError; a crafted link
+        # should be turned away like any other bad state, not become a 500.
+        with self.client.session_transaction() as session:
+            session['oauth_states'] = ['real-state']
+        response = self.client.get('/auth/callback?code=abc&state=st\u00e5te')
+        self.assertEqual(response.status_code, 400)
+
+    def test_a_prefetched_sign_in_does_not_invalidate_the_one_followed(self):
+        # The bug this guards: a browser that prerenders the sign-in link (Chrome does,
+        # from history - which is why it never reproduced in incognito) runs /login a
+        # second time before the person's own click arrives. Keeping only the newest
+        # state meant GitHub came back with one the session had already thrown away.
+        followed = self.start_login()
+        self.client.get('/login')          # the prefetch, after the real click
+        with mock.patch.object(self.app.githubauth, 'exchange_code', return_value='gho_x'), \
+             mock.patch.object(self.app.githubauth, 'fetch_user',
+                               return_value={'login': 'octocat'}), \
+             mock.patch.object(self.app.githubauth, 'assert_team_member'):
+            response = self.client.get(f'/auth/callback?code=abc&state={followed}')
+        self.assertEqual(response.status_code, 302)
+
+    def test_only_the_most_recent_states_stay_valid(self):
+        stale = self.start_login()
+        for _ in range(self.app.MAX_PENDING_STATES):
+            self.client.get('/login')
+        response = self.client.get(f'/auth/callback?code=abc&state={stale}')
+        self.assertEqual(response.status_code, 400)
+
+    def test_a_state_cannot_be_replayed_after_a_successful_login(self):
+        state = self.start_login()
+        with mock.patch.object(self.app.githubauth, 'exchange_code', return_value='gho_x'), \
+             mock.patch.object(self.app.githubauth, 'fetch_user',
+                               return_value={'login': 'octocat'}), \
+             mock.patch.object(self.app.githubauth, 'assert_team_member'):
+            self.client.get(f'/auth/callback?code=abc&state={state}')
+        self.client.delete_cookie(self.app.app.config['SESSION_COOKIE_NAME'])
+        self.assertEqual(
+            self.client.get(f'/auth/callback?code=abc&state={state}').status_code, 400)
+
+    def test_the_redirect_to_github_is_not_cacheable(self):
+        # A cached copy would send the next attempt to GitHub carrying a spent state.
+        response = self.client.get('/login')
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
+
+    def test_the_session_cookie_is_not_named_session(self):
+        # `session` is what every other Flask app on a shared parent domain writes, and
+        # a cookie of that name scoped above this host would shadow ours.
+        self.client.get('/login')
+        cookies = ''.join(
+            self.client.get('/login').headers.getlist('Set-Cookie'))
+        self.assertIn('helm_versions_session=', cookies)
+        self.assertNotIn(' session=', ' ' + cookies)
 
     def start_login(self):
         """Run /login and return the state it stashed in the session"""
         self.client.get('/login')
         with self.client.session_transaction() as session:
-            return session['oauth_state']
+            return session['oauth_states'][-1]
 
     def test_successful_login_stores_the_token_server_side(self):
         state = self.start_login()

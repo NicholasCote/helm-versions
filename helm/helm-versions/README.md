@@ -185,6 +185,7 @@ as far as credential rejection rather than a filesystem error.
 | "GitHub wouldn't answer whether you're in ..." | The org restricts OAuth Apps and hasn't approved this one. An org owner approves it once — see the note above. |
 | "Your GitHub token isn't authorized for the ... organization" | The org enforces SAML SSO; authorize the app for it on GitHub and sign in again. |
 | "You're not a member of ..." | Genuinely not an active member of `oauth.allowedTeam`. A pending invitation gets its own message. |
+| "That sign-in link has expired or didn't start here" | The session cookie the callback presented isn't the one `/login` wrote to — not an org or team problem. The pod logs `✗ OAuth callback state rejected: ...` with which shape it was; see the [application README](../../README.md#troubleshooting). |
 | Everyone signed out after a deploy | Expected: sessions are in-memory and the pod was replaced. |
 | `webapp.container.image.tag is required` | No CI build has run yet, or `values.yaml` was reverted. Pass `--set webapp.container.image.tag=<sha>`. |
 

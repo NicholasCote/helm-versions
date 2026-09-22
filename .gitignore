@@ -5,3 +5,6 @@ venv/
 
 # Written by `python tracker.py`
 multi_cluster_chart_status.json
+
+# Hand-applied Kubernetes Secret - holds the OAuth client secret in plaintext
+secret.yaml
